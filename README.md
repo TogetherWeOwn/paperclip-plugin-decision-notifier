@@ -47,6 +47,7 @@ PAPERCLIP_BOARD_TOKEN_FILE=$HOME/.paperclip/board-token \
 paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-decisions-seen
 ```
 
+- `--company` is required. `--api` overrides `PAPERCLIP_API_URL`; a trailing `/api` is stripped from either. `--plugin` overrides the plugin ID (default `togetherweown.decision-notifier`).
 - The token is read from a file, never from argv.
 - `--seen` lists announced decisions as `kind:id:createdAt`. Replayed decisions already in it do not wake the caller; entries that are no longer pending are pruned on connect. A card that is unassigned and reassigned gets a new `createdAt`, so it announces again. Use one waiter per `--seen` file; the file is not locked across processes.
 - A decision is marked seen only after stdout has accepted it.
@@ -54,7 +55,7 @@ paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-deci
 - The catch-up call, the wait for stream headers and the wait for the first frame after them time out after 30 s (`PAPERCLIP_DECISION_WAIT_TIMEOUT_MS`, a whole number of ms; invalid values fall back to the default). The open stream itself has no deadline: Paperclip sends no heartbeat, so the client reads the stream with Node's `http` module, which has no idle limit (fetch would abort after 300 s of silence), and turns on TCP keepalive so a dead connection still fails the stream.
 - The stream request does not follow redirects. Point `--api` at the final URL.
 - If the stream answers HTTP 501 ("Plugin stream bridge is not enabled"), the host has no plugin stream bus; stock Paperclip 2026.1023.0 does not wire one. The client then polls `POST /catch-up` every 30 s (`PAPERCLIP_DECISION_WAIT_POLL_MS`) with the same `--seen` handling and exits on the first unseen decision. A new decision then wakes the caller within the poll interval plus the plugin's one-minute scan for interactions. Hosts that wire the bus keep the push stream.
-- Exit 0 means a decision was printed. Exit 1 means the connection or auth failed, or the stream ended or broke; the reason is one `decision-wait: …` line on stderr.
+- Exit 0 means a decision was printed. Exit 1 means a required setting is missing, the connection or auth failed, or the stream ended or broke; the reason is one `decision-wait: …` line on stderr. An unreadable token file or an unknown flag also exits 1, but with Node's own error instead of that line.
 
 ## Configuration
 
@@ -70,7 +71,7 @@ paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-deci
 ## Limits
 
 - Private cards the plugin cannot read are not scanned.
-- The scan reads interactions for every open card each minute. That is fine for hundreds of open cards; it is temporary until #4990 lets the plugin subscribe instead.
+- The scan reads interactions for every card that is not done or cancelled (including `backlog`) each minute. That is fine for hundreds of such cards; it is temporary until #4990 lets the plugin subscribe instead.
 - Card lists are read without `limit`/`offset`: in Paperclip 2026.1023.0 the host applies `offset` twice for plugin issue lists, so paging past the first page returns nothing.
 - Delivery is at-least-once. Consumers should dedupe on `kind` + `id` + `createdAt`, as the wait client does; `createdAt` changes when an owner card starts a new pending cycle.
 
