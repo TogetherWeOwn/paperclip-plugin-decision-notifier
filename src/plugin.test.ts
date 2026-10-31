@@ -384,6 +384,10 @@ describe("catch-up", () => {
       // ...but the minute scan announces it live to the clients already subscribed.
       await harness.runJob(SCAN_JOB_KEY);
       expect(ids()).toEqual(["interaction:ix-1"]);
+      // A polling client gets it from its first catch-up after the window.
+      vi.advanceTimersByTime(CATCH_UP_RESCAN_MS);
+      const afterWindow = await catchUp();
+      expect((afterWindow.body as { pending: DecisionEvent[] }).pending.map((e) => e.id)).toEqual(["ix-1"]);
     } finally {
       vi.useRealTimers();
     }
@@ -398,6 +402,21 @@ describe("catch-up", () => {
       harness.seed({ companies: [company(COMPANY, "NEW")] });
       const response = await catchUp();
       expect((response.body as { pending: DecisionEvent[] }).pending[0].url).toBe("/NEW/approvals/ap-1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rescans when the clock moved back since the last catch-up scan", async () => {
+    const { harness } = await setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      await catchUp();
+      vi.setSystemTime(Date.now() - 60 * 60_000);
+      harness.seed({ issueInteractions: [interaction("ix-1", "i-1")] });
+      const response = await catchUp();
+      expect((response.body as { pending: DecisionEvent[] }).pending.map((e) => e.id)).toEqual(["ix-1"]);
     } finally {
       vi.useRealTimers();
     }

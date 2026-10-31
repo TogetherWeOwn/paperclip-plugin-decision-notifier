@@ -123,7 +123,9 @@ export class DecisionNotifier {
     const pending = await this.withLock(companyId, async () => {
       const config = JSON.stringify(await this.config(companyId));
       const last = this.lastCatchUpScan.get(companyId);
-      if (last && last.config === config && Date.now() - last.at < CATCH_UP_RESCAN_MS) {
+      // A negative age means the clock moved back; rescan rather than trust the window.
+      const age = last ? Date.now() - last.at : -1;
+      if (last && last.config === config && age >= 0 && age < CATCH_UP_RESCAN_MS) {
         return Object.values(await this.load(companyId)).map(toEvent);
       }
       const scanned = await this.scanLocked(companyId, false);
