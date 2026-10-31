@@ -2,6 +2,8 @@
 // Block until the decision stream announces a decision this client has not
 // seen, print it as one JSON line, and exit 0. Exit 1 on any connection or
 // auth failure, so the caller re-arms (or reports) instead of hanging.
+// If the host answers the stream with HTTP 501 (no plugin stream bus, as in
+// stock Paperclip 2026.1023.0), poll the catch-up route every 30 s instead.
 //
 //   PAPERCLIP_API_URL=https://paperclip.example.com \
 //   PAPERCLIP_BOARD_TOKEN_FILE=~/.paperclip/board-token \
@@ -18,6 +20,8 @@ import { parseArgs } from "node:util";
 const DEFAULT_PLUGIN = "togetherweown.decision-notifier";
 /** Deadline for the catch-up call and for the stream's response headers, not for the idle stream. */
 const REQUEST_TIMEOUT_MS = Number(process.env.PAPERCLIP_DECISION_WAIT_TIMEOUT_MS) || 30_000;
+/** Catch-up interval when the host has no stream bridge. */
+const POLL_INTERVAL_MS = Number(process.env.PAPERCLIP_DECISION_WAIT_POLL_MS) || 30_000;
 const KINDS = new Set(["approval", "interaction", "owner_card"]);
 
 const { values: args } = parseArgs({
@@ -104,17 +108,17 @@ async function catchUp() {
     writeFileSync(args.seen, kept.length ? `${kept.join("\n")}\n` : "");
     for (const key of seen) if (!pendingKeys.has(key)) seen.delete(key);
   }
+  return pending;
 }
 
-const connect = new AbortController();
-const connectTimer = setTimeout(() => connect.abort(new Error("timed out waiting for the stream")), REQUEST_TIMEOUT_MS);
-const response = await fetch(`${apiBase}/api/plugins/${plugin}/bridge/stream/decisions?companyId=${company}`, {
-  headers: { ...headers, Accept: "text/event-stream" },
-  signal: connect.signal,
-}).catch((err) => fail(`stream failed: ${err.message}`));
-// Headers arrived: the stream may now idle for as long as no decision is pending.
-clearTimeout(connectTimer);
-if (!response.ok || !response.body) fail(`stream failed: HTTP ${response.status}`);
+/** Poll mode: catch-up returns the pending list, so announce from it directly. */
+async function poll() {
+  for (;;) {
+    const pending = await catchUp();
+    if (pending.some(announce)) return;
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+}
 
 const decoder = new TextDecoder();
 let buffer = "";
@@ -146,20 +150,40 @@ async function drainFrames() {
   return false;
 }
 
-let announced = false;
-for await (const chunk of response.body) {
-  // SSE allows CRLF or CR line endings; the host sends LF, but normalise anyway.
-  // A trailing CR waits for the next chunk, in case it is the first half of CRLF.
-  let text = pendingCr + decoder.decode(chunk, { stream: true });
-  pendingCr = text.endsWith("\r") ? "\r" : "";
-  if (pendingCr) text = text.slice(0, -1);
-  buffer += text.replace(/\r\n?/g, "\n");
-  // announce() exits once stdout has flushed; stop reading in the meantime.
-  if ((announced = await drainFrames())) break;
+async function readStream(stream) {
+  let announced = false;
+  for await (const chunk of stream) {
+    // SSE allows CRLF or CR line endings; the host sends LF, but normalise anyway.
+    // A trailing CR waits for the next chunk, in case it is the first half of CRLF.
+    let text = pendingCr + decoder.decode(chunk, { stream: true });
+    pendingCr = text.endsWith("\r") ? "\r" : "";
+    if (pendingCr) text = text.slice(0, -1);
+    buffer += text.replace(/\r\n?/g, "\n");
+    // announce() exits once stdout has flushed; stop reading in the meantime.
+    if ((announced = await drainFrames())) break;
+  }
+  if (!announced && pendingCr) {
+    // The stream ended on a lone CR: it was a line ending, not half of CRLF.
+    buffer += "\n";
+    announced = await drainFrames();
+  }
+  if (!announced) fail("stream ended");
 }
-if (!announced && pendingCr) {
-  // The stream ended on a lone CR: it was a line ending, not half of CRLF.
-  buffer += "\n";
-  announced = await drainFrames();
+
+const connect = new AbortController();
+const connectTimer = setTimeout(() => connect.abort(new Error("timed out waiting for the stream")), REQUEST_TIMEOUT_MS);
+const response = await fetch(`${apiBase}/api/plugins/${plugin}/bridge/stream/decisions?companyId=${company}`, {
+  headers: { ...headers, Accept: "text/event-stream" },
+  signal: connect.signal,
+}).catch((err) => fail(`stream failed: ${err.message}`));
+// Headers arrived: the stream may now idle for as long as no decision is pending.
+clearTimeout(connectTimer);
+if (response.status === 501) {
+  // "Plugin stream bridge is not enabled": the host never wires a stream bus.
+  await response.body?.cancel();
+  process.stderr.write(`decision-wait: stream bridge not enabled; polling catch-up every ${POLL_INTERVAL_MS / 1000} s\n`);
+  await poll();
+} else {
+  if (!response.ok || !response.body) fail(`stream failed: HTTP ${response.status}`);
+  await readStream(response.body);
 }
-if (!announced) fail("stream ended");
