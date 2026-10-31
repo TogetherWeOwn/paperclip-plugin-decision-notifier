@@ -25,7 +25,7 @@ function delayFromEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isInteger(value) && value >= 1 && value <= 2 ** 31 - 1 ? value : fallback;
 }
-/** Deadline for the catch-up call and for the stream's response headers, not for the idle stream. */
+/** Deadline for the catch-up call, the stream's response headers and its first frame, not for the idle stream. */
 const REQUEST_TIMEOUT_MS = delayFromEnv("PAPERCLIP_DECISION_WAIT_TIMEOUT_MS", 30_000);
 /** Catch-up interval when the host has no stream bridge. */
 const POLL_INTERVAL_MS = delayFromEnv("PAPERCLIP_DECISION_WAIT_POLL_MS", 30_000);
