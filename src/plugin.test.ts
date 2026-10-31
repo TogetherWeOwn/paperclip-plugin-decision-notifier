@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest, { SCAN_JOB_KEY, STREAM_CHANNEL } from "./manifest.js";
 import plugin from "./plugin.js";
-import type { DecisionEvent } from "./notifier.js";
+import { CATCH_UP_RESCAN_MS, INTERACTION_ISSUE_STATUSES, type DecisionEvent } from "./notifier.js";
 
 type Seed = Parameters<TestHarness["seed"]>[0];
 type Company = NonNullable<Seed["companies"]>[number];
@@ -334,6 +334,40 @@ describe("catch-up", () => {
     // Already announced by catch-up; the next scan must not announce it again.
     await harness.runJob(SCAN_JOB_KEY);
     expect(ids()).toEqual(["approval:ap-new"]);
+  });
+
+  it("rescans at most once per window when catch-up is called in a loop", async () => {
+    const { harness, ids } = await setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>)] });
+    let lists = 0;
+    const list = harness.ctx.issues.list.bind(harness.ctx.issues);
+    harness.ctx.issues.list = (input) => {
+      lists += 1;
+      return list(input);
+    };
+    const scansPerCall = INTERACTION_ISSUE_STATUSES.length;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const responses = await Promise.all([catchUp(), catchUp(), catchUp()]);
+      expect(lists).toBe(scansPerCall);
+      // Every call still replays and returns the pending set.
+      for (const response of responses) {
+        expect((response.body as { pending: DecisionEvent[] }).pending.map((e) => e.id)).toEqual(["i-1"]);
+      }
+      expect(ids()).toEqual(["owner_card:i-1", "owner_card:i-1", "owner_card:i-1"]);
+      // Events keep the reused set current: a decision raised in the window is replayed.
+      harness.seed({ approvals: [approval("ap-1")] });
+      await harness.emit("approval.created", {}, { companyId: COMPANY, entityId: "ap-1" });
+      const inWindow = await catchUp();
+      expect(lists).toBe(scansPerCall);
+      expect((inWindow.body as { pending: DecisionEvent[] }).pending.map((e) => e.id).sort()).toEqual(["ap-1", "i-1"]);
+
+      vi.advanceTimersByTime(CATCH_UP_RESCAN_MS);
+      await catchUp();
+      expect(lists).toBe(2 * scansPerCall);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects unknown routes", async () => {

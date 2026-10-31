@@ -24,6 +24,12 @@ interface FakeOptions {
   later?: string[];
   /** End the stream right after the later frames. */
   endAfterLater?: boolean;
+  /** Send the later frames this long after catch-up instead of at once, leaving the stream idle. */
+  laterDelayMs?: number;
+  /** Reset the connection right after catch-up, mid-stream. */
+  resetAfterCatchUp?: boolean;
+  /** Accept the stream request but never send response headers. */
+  stallStream?: boolean;
   /** Accept catch-up but never answer it. */
   stallCatchUp?: boolean;
   /** Answer the stream with 501, like a host that never wires a stream bus. */
@@ -50,6 +56,7 @@ async function fakePaperclip(options: FakeOptions) {
         res.writeHead(501, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "Plugin stream bridge is not enabled" }));
         return;
       }
+      if (options.stallStream) return;
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.write(":ok\n\n");
       stream = res;
@@ -67,8 +74,13 @@ async function fakePaperclip(options: FakeOptions) {
         // Like the worker: replay onto the stream first, then answer.
         stream?.write(`event: open\ndata: {"type":"open"}\n\n`);
         for (const event of pending) stream?.write(`data: ${JSON.stringify(event)}\n\n`);
-        for (const frame of options.later ?? []) stream?.write(frame);
-        if (options.endAfterLater) setTimeout(() => stream?.end(), 50);
+        const sendLater = () => {
+          for (const frame of options.later ?? []) stream?.write(frame);
+          if (options.endAfterLater) setTimeout(() => stream?.end(), 50);
+        };
+        if (options.laterDelayMs) setTimeout(sendLater, options.laterDelayMs);
+        else sendLater();
+        if (options.resetAfterCatchUp) setTimeout(() => stream?.socket?.resetAndDestroy(), 50);
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ pending }));
       });
       return;
@@ -174,6 +186,48 @@ describe("decision-wait", () => {
     const result = await run(fake.url, tmpFile(), TOKEN, { PAPERCLIP_DECISION_WAIT_TIMEOUT_MS: "300" });
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("catch-up failed");
+  });
+
+  it("keeps waiting on an idle stream past the request timeout", async () => {
+    const fake = await fakePaperclip({
+      pending: [],
+      later: [`data: ${JSON.stringify(decision("approval", "ap-idle"))}\n\n`],
+      laterDelayMs: 1000,
+    });
+    const result = await run(fake.url, tmpFile(), TOKEN, { PAPERCLIP_DECISION_WAIT_TIMEOUT_MS: "200" });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).id).toBe("ap-idle");
+  });
+
+  // Fetch's 300 s body timeout used to kill an idle stream. Slow, so opt in: DECISION_WAIT_SLOW_TESTS=1.
+  it.runIf(process.env.DECISION_WAIT_SLOW_TESTS)(
+    "keeps waiting on a stream that is idle for longer than 300 s",
+    async () => {
+      const fake = await fakePaperclip({
+        pending: [],
+        later: [`data: ${JSON.stringify(decision("approval", "ap-late"))}\n\n`],
+        laterDelayMs: 310_000,
+      });
+      const result = await run(fake.url, tmpFile(), TOKEN, {}, 320_000);
+      expect(result.stderr).toBe("");
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).id).toBe("ap-late");
+    },
+    330_000,
+  );
+
+  it("exits 1 with a one-line reason when the stream breaks mid-read", async () => {
+    const fake = await fakePaperclip({ pending: [], resetAfterCatchUp: true });
+    const result = await run(fake.url, tmpFile());
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/^decision-wait: stream failed: .+\n$/);
+  });
+
+  it("exits 1 when the stream never answers", async () => {
+    const fake = await fakePaperclip({ pending: [], stallStream: true });
+    const result = await run(fake.url, tmpFile(), TOKEN, { PAPERCLIP_DECISION_WAIT_TIMEOUT_MS: "300" });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toBe("decision-wait: stream failed: timed out waiting for the stream\n");
   });
 
   it("exits 1 on an auth failure and keeps the token out of the output", async () => {

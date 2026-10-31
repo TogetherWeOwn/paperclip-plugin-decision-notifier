@@ -38,6 +38,8 @@ export const OPEN_ISSUE_STATUSES = ["todo", "in_progress", "in_review", "blocked
 /** Statuses that can hold a pending interaction: Paperclip expires them only on done/cancelled. */
 export const INTERACTION_ISSUE_STATUSES = ["backlog", ...OPEN_ISSUE_STATUSES] as const;
 const INTERACTION_READ_CONCURRENCY = 8;
+/** A catch-up this soon after the previous catch-up scan replays the stored set instead of rescanning. */
+export const CATCH_UP_RESCAN_MS = 10_000;
 
 const decisionKey = (kind: DecisionKind, id: string) => `${kind}:${id}`;
 const pendingStateKey = (companyId: string) => ({
@@ -80,6 +82,8 @@ export class DecisionNotifier {
   private readonly locks = new Map<string, Promise<unknown>>();
   /** Company the stream channel is currently opened for; emit() routes to it. */
   private openedCompanyId: string | null = null;
+  /** When each company's last catch-up scan finished, so a burst of catch-ups costs one scan. */
+  private readonly lastCatchUpScanAt = new Map<string, number>();
 
   constructor(private readonly ctx: PluginContext) {}
 
@@ -102,19 +106,26 @@ export class DecisionNotifier {
   async scanCompany(companyId: string, options: { emitNew?: boolean } = {}): Promise<DecisionEvent[]> {
     // Collect under the lock too, so an event landing mid-scan is not dropped
     // from the stored set and re-announced by the next scan.
-    return this.withLock(companyId, async () => {
-      const current = await this.collect(companyId);
-      const next = await this.commit(companyId, () => current, options.emitNew !== false);
-      return Object.values(next).map(toEvent);
-    });
+    return this.withLock(companyId, () => this.scanLocked(companyId, options.emitNew !== false));
   }
 
   /**
    * Catch-up for a client that just connected to the stream: rescan, then
    * replay every pending decision onto the stream and return the same list.
+   * Catch-ups within CATCH_UP_RESCAN_MS of the last catch-up scan reuse the
+   * stored set, which events keep current, so a client calling in a loop
+   * cannot make the worker rescan the whole company each time.
    */
   async catchUp(companyId: string): Promise<DecisionEvent[]> {
-    const pending = await this.scanCompany(companyId, { emitNew: false });
+    const pending = await this.withLock(companyId, async () => {
+      const lastScan = this.lastCatchUpScanAt.get(companyId);
+      if (lastScan !== undefined && Date.now() - lastScan < CATCH_UP_RESCAN_MS) {
+        return Object.values(await this.load(companyId)).map(toEvent);
+      }
+      const scanned = await this.scanLocked(companyId, false);
+      this.lastCatchUpScanAt.set(companyId, Date.now());
+      return scanned;
+    });
     for (const event of pending) this.emitEvent(companyId, event);
     return pending;
   }
@@ -156,6 +167,13 @@ export class DecisionNotifier {
         return next;
       });
     });
+  }
+
+  /** Collect and commit one company. Call with the company lock held. */
+  private async scanLocked(companyId: string, emitNew: boolean): Promise<DecisionEvent[]> {
+    const current = await this.collect(companyId);
+    const next = await this.commit(companyId, () => current, emitNew);
+    return Object.values(next).map(toEvent);
   }
 
   /**
