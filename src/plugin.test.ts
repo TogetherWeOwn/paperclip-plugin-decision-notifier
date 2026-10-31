@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
+import { readFileSync } from "node:fs";
 import manifest, { SCAN_JOB_KEY, STREAM_CHANNEL } from "./manifest.js";
 import plugin from "./plugin.js";
 import { CATCH_UP_RESCAN_MS, INTERACTION_ISSUE_STATUSES, type DecisionEvent } from "./notifier.js";
@@ -370,6 +371,24 @@ describe("catch-up", () => {
     }
   });
 
+  it("still delivers an interaction raised inside the window, with the next scan", async () => {
+    const { harness, ids } = await setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      await catchUp();
+      // Interactions have no plugin event: the reused set does not have it yet...
+      harness.seed({ issueInteractions: [interaction("ix-1", "i-1")] });
+      const inWindow = await catchUp();
+      expect((inWindow.body as { pending: DecisionEvent[] }).pending).toEqual([]);
+      // ...but the minute scan announces it live to the clients already subscribed.
+      await harness.runJob(SCAN_JOB_KEY);
+      expect(ids()).toEqual(["interaction:ix-1"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects unknown routes", async () => {
     await setup();
     const response = await plugin.definition.onApiRequest!({
@@ -414,5 +433,12 @@ describe("no payload text", () => {
     const body = JSON.stringify(response.body);
     expect(body).not.toContain("secret-payload");
     expect(body).not.toContain("issueId\"");
+  });
+});
+
+describe("release", () => {
+  it("advertises the package version in the manifest", () => {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+    expect(manifest.version).toBe(pkg.version);
   });
 });
