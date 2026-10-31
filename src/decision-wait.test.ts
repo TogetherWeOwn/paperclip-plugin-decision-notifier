@@ -24,6 +24,8 @@ interface FakeOptions {
   later?: string[];
   /** End the stream right after the later frames. */
   endAfterLater?: boolean;
+  /** Accept catch-up but never answer it. */
+  stallCatchUp?: boolean;
 }
 
 let server: Server | null = null;
@@ -48,6 +50,7 @@ async function fakePaperclip(options: FakeOptions) {
       let raw = "";
       req.on("data", (c) => (raw += c));
       req.on("end", () => {
+        if (options.stallCatchUp) return;
         expect(JSON.parse(raw)).toEqual({ companyId: "c-1" });
         // Like the worker: replay onto the stream first, then answer.
         stream?.write(`event: open\ndata: {"type":"open"}\n\n`);
@@ -66,13 +69,13 @@ async function fakePaperclip(options: FakeOptions) {
   return { url: `http://127.0.0.1:${port}`, seenAuth };
 }
 
-function run(apiUrl: string, seenFile: string, token = TOKEN) {
+function run(apiUrl: string, seenFile: string, token = TOKEN, extraEnv: Record<string, string> = {}) {
   const dir = mkdtempSync(join(tmpdir(), "dw-"));
   const tokenFile = join(dir, "token");
   writeFileSync(tokenFile, `${token}\n`);
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
     const child = spawn(process.execPath, [SCRIPT, "--company", "c-1", "--seen", seenFile], {
-      env: { PATH: process.env.PATH, PAPERCLIP_API_URL: `${apiUrl}/api`, PAPERCLIP_BOARD_TOKEN_FILE: tokenFile },
+      env: { PATH: process.env.PATH, PAPERCLIP_API_URL: `${apiUrl}/api`, PAPERCLIP_BOARD_TOKEN_FILE: tokenFile, ...extraEnv },
     });
     let stdout = "";
     let stderr = "";
@@ -152,6 +155,13 @@ describe("decision-wait", () => {
     const result = await run(fake.url, tmpFile());
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).id).toBe("ap-cr");
+  });
+
+  it("exits 1 when catch-up stalls instead of blocking the stream", async () => {
+    const fake = await fakePaperclip({ pending: [], stallCatchUp: true });
+    const result = await run(fake.url, tmpFile(), TOKEN, { PAPERCLIP_DECISION_WAIT_TIMEOUT_MS: "300" });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("catch-up failed");
   });
 
   it("exits 1 on an auth failure and keeps the token out of the output", async () => {

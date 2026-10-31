@@ -33,7 +33,7 @@ GET  /api/plugins/togetherweown.decision-notifier/bridge/stream/decisions?compan
 POST /api/plugins/togetherweown.decision-notifier/api/catch-up   {"companyId":"<companyId>"}
 ```
 
-Both need a board credential (a board API key or browser session). The stream is Server-Sent Events. Ignore frames with an `event:` line (`open`, `close`); decisions are the plain `data:` frames.
+Both need a board credential (a board API key or browser session). The stream is Server-Sent Events. Decisions are the plain `data:` frames. Ignore `event: open`. On `event: close` the plugin worker has stopped and Paperclip leaves the response open with nothing behind it: disconnect, reconnect, and call catch-up again. The wait client exits 1 on `close` so its caller re-arms.
 
 Paperclip does not tell a plugin when a client connects, so catch-up is an explicit call: open the stream, wait for the server's `:ok` comment, then `POST /catch-up`. The plugin rescans, replays every pending decision onto the stream, and also returns them as `{"pending":[…]}`. Subscribing first means nothing falls between the replay and live events.
 
@@ -51,6 +51,7 @@ paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-deci
 - `--seen` lists announced decisions as `kind:id:createdAt`. Replayed decisions already in it do not wake the caller; entries that are no longer pending are pruned on connect. A card that is unassigned and reassigned gets a new `createdAt`, so it announces again. Use one waiter per `--seen` file; the file is not locked across processes.
 - A decision is marked seen only after stdout has accepted it.
 - Events are hints: a decision can resolve between the replay and your read. Re-read it from Paperclip before acting.
+- The catch-up call and the wait for stream headers time out after 30 s (`PAPERCLIP_DECISION_WAIT_TIMEOUT_MS`); the open stream itself has no deadline.
 - Exit 0 means a decision was printed. Exit 1 means the connection or auth failed; the reason is on stderr.
 
 ## Configuration

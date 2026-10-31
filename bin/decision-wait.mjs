@@ -16,6 +16,8 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { parseArgs } from "node:util";
 
 const DEFAULT_PLUGIN = "togetherweown.decision-notifier";
+/** Deadline for the catch-up call and for the stream's response headers, not for the idle stream. */
+const REQUEST_TIMEOUT_MS = Number(process.env.PAPERCLIP_DECISION_WAIT_TIMEOUT_MS) || 30_000;
 const KINDS = new Set(["approval", "interaction", "owner_card"]);
 
 const { values: args } = parseArgs({
@@ -89,9 +91,11 @@ async function catchUp() {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify({ companyId: args.company }),
-  });
+    // Covers reading the body too, so a stalled response cannot block the stream.
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  }).catch((err) => fail(`catch-up failed: ${err.message}`));
   if (!response.ok) fail(`catch-up failed: HTTP ${response.status}`);
-  const body = await response.json();
+  const body = await response.json().catch((err) => fail(`catch-up failed: ${err.message}`));
   const pending = Array.isArray(body?.pending) ? body.pending.map((e) => parseDecision(JSON.stringify(e))).filter(Boolean) : [];
   if (args.seen) {
     // Forget decisions that were resolved, so they announce again if they come back.
@@ -102,9 +106,14 @@ async function catchUp() {
   }
 }
 
+const connect = new AbortController();
+const connectTimer = setTimeout(() => connect.abort(new Error("timed out waiting for the stream")), REQUEST_TIMEOUT_MS);
 const response = await fetch(`${apiBase}/api/plugins/${plugin}/bridge/stream/decisions?companyId=${company}`, {
   headers: { ...headers, Accept: "text/event-stream" },
-});
+  signal: connect.signal,
+}).catch((err) => fail(`stream failed: ${err.message}`));
+// Headers arrived: the stream may now idle for as long as no decision is pending.
+clearTimeout(connectTimer);
 if (!response.ok || !response.body) fail(`stream failed: HTTP ${response.status}`);
 
 const decoder = new TextDecoder();
