@@ -111,14 +111,9 @@ const decoder = new TextDecoder();
 let buffer = "";
 let pendingCr = "";
 let caughtUp = false;
-let announced = false;
-for await (const chunk of response.body) {
-  // SSE allows CRLF or CR line endings; the host sends LF, but normalise anyway.
-  // A trailing CR waits for the next chunk, in case it is the first half of CRLF.
-  let text = pendingCr + decoder.decode(chunk, { stream: true });
-  pendingCr = text.endsWith("\r") ? "\r" : "";
-  if (pendingCr) text = text.slice(0, -1);
-  buffer += text.replace(/\r\n?/g, "\n");
+
+/** Handle every complete frame in the buffer. Returns true once a decision is announced. */
+async function drainFrames() {
   let boundary;
   while ((boundary = buffer.indexOf("\n\n")) !== -1) {
     const frame = buffer.slice(0, boundary);
@@ -137,12 +132,25 @@ for await (const chunk of response.body) {
     if (type === "close") fail("stream closed by the plugin worker");
     if (type !== "message" || data.length === 0) continue;
     const decision = parseDecision(data.join("\n"));
-    if (decision && announce(decision)) {
-      announced = true;
-      break;
-    }
+    if (decision && announce(decision)) return true;
   }
+  return false;
+}
+
+let announced = false;
+for await (const chunk of response.body) {
+  // SSE allows CRLF or CR line endings; the host sends LF, but normalise anyway.
+  // A trailing CR waits for the next chunk, in case it is the first half of CRLF.
+  let text = pendingCr + decoder.decode(chunk, { stream: true });
+  pendingCr = text.endsWith("\r") ? "\r" : "";
+  if (pendingCr) text = text.slice(0, -1);
+  buffer += text.replace(/\r\n?/g, "\n");
   // announce() exits once stdout has flushed; stop reading in the meantime.
-  if (announced) break;
+  if ((announced = await drainFrames())) break;
+}
+if (!announced && pendingCr) {
+  // The stream ended on a lone CR: it was a line ending, not half of CRLF.
+  buffer += "\n";
+  announced = await drainFrames();
 }
 if (!announced) fail("stream ended");

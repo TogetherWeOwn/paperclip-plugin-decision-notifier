@@ -22,6 +22,8 @@ interface FakeOptions {
   pending: object[];
   /** Frames sent after the replay, as raw SSE text. */
   later?: string[];
+  /** End the stream right after the later frames. */
+  endAfterLater?: boolean;
 }
 
 let server: Server | null = null;
@@ -51,6 +53,7 @@ async function fakePaperclip(options: FakeOptions) {
         stream?.write(`event: open\ndata: {"type":"open"}\n\n`);
         for (const event of options.pending) stream?.write(`data: ${JSON.stringify(event)}\n\n`);
         for (const frame of options.later ?? []) stream?.write(frame);
+        if (options.endAfterLater) setTimeout(() => stream?.end(), 50);
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ pending: options.pending }));
       });
       return;
@@ -138,6 +141,17 @@ describe("decision-wait", () => {
     const result = await run(fake.url, tmpFile());
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).id).toBe("ap-crlf");
+  });
+
+  it("announces a CR-only frame that ends the stream", async () => {
+    const fake = await fakePaperclip({
+      pending: [],
+      later: [`data: ${JSON.stringify(decision("approval", "ap-cr"))}\r\r`],
+      endAfterLater: true,
+    });
+    const result = await run(fake.url, tmpFile());
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).id).toBe("ap-cr");
   });
 
   it("exits 1 on an auth failure and keeps the token out of the output", async () => {

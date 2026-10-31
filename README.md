@@ -69,7 +69,7 @@ paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-deci
 - Private cards the plugin cannot read are not scanned.
 - The scan reads interactions for every open card each minute. That is fine for hundreds of open cards; it is temporary until #4990 lets the plugin subscribe instead.
 - Card lists are read without `limit`/`offset`: in Paperclip 2026.1023.0 the host applies `offset` twice for plugin issue lists, so paging past the first page returns nothing.
-- Delivery is at-least-once. Consumers should dedupe on `kind` + `id` (the wait client does).
+- Delivery is at-least-once. Consumers should dedupe on `kind` + `id` + `createdAt`, as the wait client does; `createdAt` changes when an owner card starts a new pending cycle.
 
 ## Development
 
