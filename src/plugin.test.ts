@@ -1,8 +1,9 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
+import { readFileSync } from "node:fs";
 import manifest, { SCAN_JOB_KEY, STREAM_CHANNEL } from "./manifest.js";
 import plugin from "./plugin.js";
-import type { DecisionEvent } from "./notifier.js";
+import { CATCH_UP_RESCAN_MS, INTERACTION_ISSUE_STATUSES, type DecisionEvent } from "./notifier.js";
 
 type Seed = Parameters<TestHarness["seed"]>[0];
 type Company = NonNullable<Seed["companies"]>[number];
@@ -336,6 +337,91 @@ describe("catch-up", () => {
     expect(ids()).toEqual(["approval:ap-new"]);
   });
 
+  it("rescans at most once per window when catch-up is called in a loop", async () => {
+    const { harness, ids } = await setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>)] });
+    let lists = 0;
+    const list = harness.ctx.issues.list.bind(harness.ctx.issues);
+    harness.ctx.issues.list = (input) => {
+      lists += 1;
+      return list(input);
+    };
+    const scansPerCall = INTERACTION_ISSUE_STATUSES.length;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const responses = await Promise.all([catchUp(), catchUp(), catchUp()]);
+      expect(lists).toBe(scansPerCall);
+      // Every call still replays and returns the pending set.
+      for (const response of responses) {
+        expect((response.body as { pending: DecisionEvent[] }).pending.map((e) => e.id)).toEqual(["i-1"]);
+      }
+      expect(ids()).toEqual(["owner_card:i-1", "owner_card:i-1", "owner_card:i-1"]);
+      // Events keep the reused set current: a decision raised in the window is replayed.
+      harness.seed({ approvals: [approval("ap-1")] });
+      await harness.emit("approval.created", {}, { companyId: COMPANY, entityId: "ap-1" });
+      const inWindow = await catchUp();
+      expect(lists).toBe(scansPerCall);
+      expect((inWindow.body as { pending: DecisionEvent[] }).pending.map((e) => e.id).sort()).toEqual(["ap-1", "i-1"]);
+
+      vi.advanceTimersByTime(CATCH_UP_RESCAN_MS);
+      await catchUp();
+      expect(lists).toBe(2 * scansPerCall);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still delivers an interaction raised inside the window, with the next scan", async () => {
+    const { harness, ids } = await setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      await catchUp();
+      // Interactions have no plugin event: the reused set does not have it yet...
+      harness.seed({ issueInteractions: [interaction("ix-1", "i-1")] });
+      const inWindow = await catchUp();
+      expect((inWindow.body as { pending: DecisionEvent[] }).pending).toEqual([]);
+      // ...but the minute scan announces it live to the clients already subscribed.
+      await harness.runJob(SCAN_JOB_KEY);
+      expect(ids()).toEqual(["interaction:ix-1"]);
+      // A polling client gets it from its first catch-up after the window.
+      vi.advanceTimersByTime(CATCH_UP_RESCAN_MS);
+      const afterWindow = await catchUp();
+      expect((afterWindow.body as { pending: DecisionEvent[] }).pending.map((e) => e.id)).toEqual(["ix-1"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rescans inside the window when the company prefix changed", async () => {
+    const { harness } = await setup();
+    harness.seed({ approvals: [approval("ap-1")] });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      await catchUp();
+      harness.seed({ companies: [company(COMPANY, "NEW")] });
+      const response = await catchUp();
+      expect((response.body as { pending: DecisionEvent[] }).pending[0].url).toBe("/NEW/approvals/ap-1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rescans when the clock moved back since the last catch-up scan", async () => {
+    const { harness } = await setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      await catchUp();
+      vi.setSystemTime(Date.now() - 60 * 60_000);
+      harness.seed({ issueInteractions: [interaction("ix-1", "i-1")] });
+      const response = await catchUp();
+      expect((response.body as { pending: DecisionEvent[] }).pending.map((e) => e.id)).toEqual(["ix-1"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects unknown routes", async () => {
     await setup();
     const response = await plugin.definition.onApiRequest!({
@@ -380,5 +466,12 @@ describe("no payload text", () => {
     const body = JSON.stringify(response.body);
     expect(body).not.toContain("secret-payload");
     expect(body).not.toContain("issueId\"");
+  });
+});
+
+describe("release", () => {
+  it("advertises the package version in the manifest", () => {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+    expect(manifest.version).toBe(pkg.version);
   });
 });

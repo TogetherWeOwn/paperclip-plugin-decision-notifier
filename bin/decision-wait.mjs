@@ -15,6 +15,8 @@
 // caller for new work, and entries that are no longer pending are pruned.
 // Run one waiter per --seen file; the file is not locked across processes.
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { parseArgs } from "node:util";
 
 const DEFAULT_PLUGIN = "togetherweown.decision-notifier";
@@ -27,6 +29,8 @@ function delayFromEnv(name, fallback) {
 const REQUEST_TIMEOUT_MS = delayFromEnv("PAPERCLIP_DECISION_WAIT_TIMEOUT_MS", 30_000);
 /** Catch-up interval when the host has no stream bridge. */
 const POLL_INTERVAL_MS = delayFromEnv("PAPERCLIP_DECISION_WAIT_POLL_MS", 30_000);
+/** Idle time before TCP keepalive probes start, so a dead connection still fails the stream. */
+const KEEPALIVE_MS = 60_000;
 const KINDS = new Set(["approval", "interaction", "owner_card"]);
 
 const { values: args } = parseArgs({
@@ -129,6 +133,8 @@ const decoder = new TextDecoder();
 let buffer = "";
 let pendingCr = "";
 let caughtUp = false;
+/** Deadline for the first frame after the headers; until it arrives, catch-up has not run. */
+let firstFrameTimer;
 
 /** Handle every complete frame in the buffer. Returns true once a decision is announced. */
 async function drainFrames() {
@@ -145,6 +151,7 @@ async function drainFrames() {
     if (!caughtUp) {
       // The server's first frame (":ok") means we are subscribed; replay now so nothing falls in a gap.
       caughtUp = true;
+      clearTimeout(firstFrameTimer);
       await catchUp();
     }
     if (type === "close") fail("stream closed by the plugin worker");
@@ -175,20 +182,44 @@ async function readStream(stream) {
   if (!announced) fail("stream ended");
 }
 
-const connect = new AbortController();
-const connectTimer = setTimeout(() => connect.abort(new Error("timed out waiting for the stream")), REQUEST_TIMEOUT_MS);
-const response = await fetch(`${apiBase}/api/plugins/${plugin}/bridge/stream/decisions?companyId=${company}`, {
-  headers: { ...headers, Accept: "text/event-stream" },
-  signal: connect.signal,
-}).catch((err) => fail(`stream failed: ${err.message}`));
-// Headers arrived: the stream may now idle for as long as no decision is pending.
-clearTimeout(connectTimer);
-if (response.status === 501) {
+/**
+ * Open the stream with node:http rather than fetch. Fetch (undici) aborts a
+ * body that sends nothing for 300 s, and Paperclip sends no SSE heartbeat, so
+ * an idle fetch stream died every five minutes. Here only the wait for
+ * response headers has a deadline; TCP keepalive notices a dead peer.
+ */
+function openStream(href) {
+  // A throw in here (bad URL, unsupported protocol) rejects the promise, so it reaches fail().
+  return new Promise((resolve, reject) => {
+    const url = new URL(href);
+    const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(
+      url,
+      { headers: { ...headers, Accept: "text/event-stream" } },
+      (response) => {
+        clearTimeout(timer);
+        resolve(response);
+      },
+    );
+    const timer = setTimeout(() => request.destroy(new Error("timed out waiting for the stream")), REQUEST_TIMEOUT_MS);
+    request.on("socket", (socket) => socket.setKeepAlive(true, KEEPALIVE_MS));
+    request.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    request.end();
+  });
+}
+
+const response = await openStream(`${apiBase}/api/plugins/${plugin}/bridge/stream/decisions?companyId=${company}`).catch((err) => fail(`stream failed: ${err.message}`));
+// Headers arrived: once the first frame is in, the stream may idle for as long as no decision is pending.
+const status = response.statusCode;
+if (status === 501) {
   // "Plugin stream bridge is not enabled": the host never wires a stream bus.
-  await response.body?.cancel();
+  response.destroy();
   process.stderr.write(`decision-wait: stream bridge not enabled; polling catch-up every ${POLL_INTERVAL_MS / 1000} s\n`);
   await poll();
 } else {
-  if (!response.ok || !response.body) fail(`stream failed: HTTP ${response.status}`);
-  await readStream(response.body);
+  if (status < 200 || status > 299) fail(`stream failed: HTTP ${status}`);
+  firstFrameTimer = setTimeout(() => fail("stream failed: no frame after the headers"), REQUEST_TIMEOUT_MS);
+  await readStream(response).catch((err) => fail(`stream failed: ${err.message}`));
 }
