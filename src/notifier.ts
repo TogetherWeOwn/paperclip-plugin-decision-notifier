@@ -50,6 +50,13 @@ export function toEvent(decision: DecisionEvent): DecisionEvent {
 const isoString = (value: Date | string | null | undefined): string =>
   value ? new Date(value).toISOString() : new Date().toISOString();
 
+/** Compare pending sets by key and value; key order is not meaningful. */
+function samePending(a: PendingMap, b: PendingMap): boolean {
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every((key) => b[key] !== undefined && JSON.stringify(a[key]) === JSON.stringify(b[key]));
+}
+
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);
   let next = 0;
@@ -163,7 +170,7 @@ export class DecisionNotifier {
       next[key] = previous ? { ...decision, createdAt: previous.createdAt } : decision;
       if (!previous) fresh.push(decision);
     }
-    if (JSON.stringify(next) !== JSON.stringify(stored)) await this.save(companyId, next);
+    if (!samePending(next, stored)) await this.save(companyId, next);
     if (emitNew) for (const decision of fresh) this.emit(companyId, decision);
     return next;
   }

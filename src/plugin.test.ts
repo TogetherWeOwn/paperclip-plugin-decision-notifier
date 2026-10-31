@@ -251,6 +251,26 @@ describe("review regressions", () => {
     expect(harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "pending" })).toEqual({});
   });
 
+  it("does not rewrite state for an unchanged card that precedes another in state", async () => {
+    const { harness } = await setup();
+    harness.seed({
+      issues: [
+        issue("i-a", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>),
+        issue("i-b", "TWO-2", { assigneeUserId: OWNER } as Partial<Issue>),
+      ],
+    });
+    await harness.runJob(SCAN_JOB_KEY);
+    const writes: unknown[] = [];
+    const originalSet = harness.ctx.state.set.bind(harness.ctx.state);
+    harness.ctx.state.set = async (key, value) => {
+      writes.push(value);
+      return originalSet(key, value);
+    };
+    await harness.emit("issue.updated", {}, { companyId: COMPANY, entityId: "i-a" });
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(writes).toEqual([]);
+  });
+
   it("refreshes URLs after a config change but keeps the first-seen createdAt", async () => {
     const { harness } = await setup({ publicBaseUrl: "https://old.example" });
     harness.seed({ issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>)] });
