@@ -81,7 +81,7 @@ async function fakePaperclip(options: FakeOptions) {
   return { url: `http://127.0.0.1:${port}`, seenAuth, catchUps };
 }
 
-function run(apiUrl: string, seenFile: string, token = TOKEN, extraEnv: Record<string, string> = {}) {
+function run(apiUrl: string, seenFile: string, token = TOKEN, extraEnv: Record<string, string> = {}, killAfterMs = 5000) {
   const dir = mkdtempSync(join(tmpdir(), "dw-"));
   const tokenFile = join(dir, "token");
   writeFileSync(tokenFile, `${token}\n`);
@@ -93,7 +93,7 @@ function run(apiUrl: string, seenFile: string, token = TOKEN, extraEnv: Record<s
     let stderr = "";
     child.stdout.on("data", (c) => (stdout += c));
     child.stderr.on("data", (c) => (stderr += c));
-    const timer = setTimeout(() => child.kill(), 5000);
+    const timer = setTimeout(() => child.kill(), killAfterMs);
     child.on("close", (code) => {
       clearTimeout(timer);
       resolve({ code, stdout, stderr });
@@ -209,6 +209,14 @@ describe("decision-wait", () => {
       const result = await run(fake.url, tmpFile(), TOKEN, fastPoll);
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout).id).toBe("i-1");
+      expect(fake.catchUps.count).toBe(1);
+    });
+
+    it.each(["-1", "0", "abc", "3000000000"])("ignores an invalid poll interval (%s) instead of polling in a tight loop", async (pollMs) => {
+      const fake = await fakePaperclip({ pending: [], noBridge: true });
+      const result = await run(fake.url, tmpFile(), TOKEN, { PAPERCLIP_DECISION_WAIT_POLL_MS: pollMs }, 600);
+      // Killed while waiting out the default 30 s interval, after a single catch-up.
+      expect(result.code).toBeNull();
       expect(fake.catchUps.count).toBe(1);
     });
 
