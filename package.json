@@ -1,6 +1,6 @@
 {
   "name": "@togetherweown/paperclip-plugin-decision-notifier",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Paperclip plugin that pushes pending board decisions (approvals, thread interactions, owner-assigned cards) onto a board-readable SSE stream, IDs and URLs only.",
   "license": "MIT",
   "type": "module",

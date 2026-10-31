@@ -26,6 +26,10 @@ interface FakeOptions {
   endAfterLater?: boolean;
   /** Accept catch-up but never answer it. */
   stallCatchUp?: boolean;
+  /** Answer the stream with 501, like a host that never wires a stream bus. */
+  noBridge?: boolean;
+  /** Pending list for the nth catch-up call (the last one repeats); overrides `pending`. */
+  pendingByCall?: object[][];
 }
 
 let server: Server | null = null;
@@ -33,6 +37,7 @@ afterEach(() => server?.close());
 
 async function fakePaperclip(options: FakeOptions) {
   const seenAuth: string[] = [];
+  const catchUps = { count: 0 };
   let stream: ServerResponse | null = null;
   server = createServer((req, res) => {
     seenAuth.push(String(req.headers.authorization));
@@ -41,6 +46,10 @@ async function fakePaperclip(options: FakeOptions) {
       return;
     }
     if (req.method === "GET" && req.url?.startsWith("/api/plugins/togetherweown.decision-notifier/bridge/stream/decisions?companyId=c-1")) {
+      if (options.noBridge) {
+        res.writeHead(501, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "Plugin stream bridge is not enabled" }));
+        return;
+      }
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.write(":ok\n\n");
       stream = res;
@@ -52,12 +61,15 @@ async function fakePaperclip(options: FakeOptions) {
       req.on("end", () => {
         if (options.stallCatchUp) return;
         expect(JSON.parse(raw)).toEqual({ companyId: "c-1" });
+        const calls = options.pendingByCall;
+        const pending = calls ? calls[Math.min(catchUps.count, calls.length - 1)] : options.pending;
+        catchUps.count += 1;
         // Like the worker: replay onto the stream first, then answer.
         stream?.write(`event: open\ndata: {"type":"open"}\n\n`);
-        for (const event of options.pending) stream?.write(`data: ${JSON.stringify(event)}\n\n`);
+        for (const event of pending) stream?.write(`data: ${JSON.stringify(event)}\n\n`);
         for (const frame of options.later ?? []) stream?.write(frame);
         if (options.endAfterLater) setTimeout(() => stream?.end(), 50);
-        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ pending: options.pending }));
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ pending }));
       });
       return;
     }
@@ -66,10 +78,10 @@ async function fakePaperclip(options: FakeOptions) {
   await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : 0;
-  return { url: `http://127.0.0.1:${port}`, seenAuth };
+  return { url: `http://127.0.0.1:${port}`, seenAuth, catchUps };
 }
 
-function run(apiUrl: string, seenFile: string, token = TOKEN, extraEnv: Record<string, string> = {}) {
+function run(apiUrl: string, seenFile: string, token = TOKEN, extraEnv: Record<string, string> = {}, killAfterMs = 5000) {
   const dir = mkdtempSync(join(tmpdir(), "dw-"));
   const tokenFile = join(dir, "token");
   writeFileSync(tokenFile, `${token}\n`);
@@ -81,7 +93,7 @@ function run(apiUrl: string, seenFile: string, token = TOKEN, extraEnv: Record<s
     let stderr = "";
     child.stdout.on("data", (c) => (stdout += c));
     child.stderr.on("data", (c) => (stderr += c));
-    const timer = setTimeout(() => child.kill(), 5000);
+    const timer = setTimeout(() => child.kill(), killAfterMs);
     child.on("close", (code) => {
       clearTimeout(timer);
       resolve({ code, stdout, stderr });
@@ -170,5 +182,56 @@ describe("decision-wait", () => {
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("HTTP 403");
     expect(result.stderr + result.stdout).not.toContain("wrong-token");
+  });
+
+  describe("when the host answers the stream with 501", () => {
+    const fastPoll = { PAPERCLIP_DECISION_WAIT_POLL_MS: "100" };
+
+    it("polls catch-up until an unseen decision is pending", async () => {
+      const fake = await fakePaperclip({
+        pending: [],
+        noBridge: true,
+        pendingByCall: [[decision("approval", "ap-1")], [decision("approval", "ap-1")], [decision("approval", "ap-1"), decision("interaction", "ix-2")]],
+      });
+      const seen = tmpFile();
+      writeFileSync(seen, "approval:ap-1:2026-10-31T12:00:00.000Z\nowner_card:resolved:2026-10-31T12:00:00.000Z\n");
+      const result = await run(fake.url, seen, TOKEN, fastPoll);
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual(decision("interaction", "ix-2"));
+      expect(result.stderr).toContain("polling catch-up");
+      expect(fake.catchUps.count).toBe(3);
+      // Same seen-file semantics as stream mode: resolved entries pruned, the new one recorded.
+      expect(readFileSync(seen, "utf8").split("\n").filter(Boolean).sort()).toEqual(["approval:ap-1:2026-10-31T12:00:00.000Z", "interaction:ix-2:2026-10-31T12:00:00.000Z"]);
+    });
+
+    it("wakes on the first poll when a decision is already pending", async () => {
+      const fake = await fakePaperclip({ pending: [decision("owner_card", "i-1")], noBridge: true });
+      const result = await run(fake.url, tmpFile(), TOKEN, fastPoll);
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).id).toBe("i-1");
+      expect(fake.catchUps.count).toBe(1);
+    });
+
+    it.each(["-1", "0", "abc", "3000000000"])("ignores an invalid poll interval (%s) instead of polling in a tight loop", async (pollMs) => {
+      const fake = await fakePaperclip({ pending: [], noBridge: true });
+      const result = await run(fake.url, tmpFile(), TOKEN, { PAPERCLIP_DECISION_WAIT_POLL_MS: pollMs }, 600);
+      // Killed while waiting out the default 30 s interval, after a single catch-up.
+      expect(result.code).toBeNull();
+      expect(fake.catchUps.count).toBe(1);
+    });
+
+    it("exits 1 when catch-up fails while polling", async () => {
+      const fake = await fakePaperclip({ pending: [], noBridge: true, stallCatchUp: true });
+      const result = await run(fake.url, tmpFile(), TOKEN, { ...fastPoll, PAPERCLIP_DECISION_WAIT_TIMEOUT_MS: "300" });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("catch-up failed");
+    });
+  });
+
+  it("still exits 1 on other stream errors", async () => {
+    const fake = await fakePaperclip({ pending: [] });
+    const result = await run(`${fake.url}/missing`, tmpFile());
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("HTTP 404");
   });
 });
