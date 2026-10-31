@@ -26,13 +26,17 @@ interface StoredDecision extends DecisionEvent {
 
 type PendingMap = Record<string, StoredDecision>;
 
+/** Per-operation settings: plugin config plus the company's current URL prefix. */
 interface NotifierConfig {
   publicBaseUrl: string;
   ownerUserIds: string[];
+  prefix: string;
 }
 
-/** Statuses whose cards can hold a pending decision. Backlog, done and cancelled cards cannot. */
+/** Statuses where an owner-assigned card counts as a decision. */
 export const OPEN_ISSUE_STATUSES = ["todo", "in_progress", "in_review", "blocked"] as const;
+/** Statuses that can hold a pending interaction: Paperclip expires them only on done/cancelled. */
+export const INTERACTION_ISSUE_STATUSES = ["backlog", ...OPEN_ISSUE_STATUSES] as const;
 const INTERACTION_READ_CONCURRENCY = 8;
 
 const decisionKey = (kind: DecisionKind, id: string) => `${kind}:${id}`;
@@ -49,6 +53,8 @@ export function toEvent(decision: DecisionEvent): DecisionEvent {
 
 const isoString = (value: Date | string | null | undefined): string =>
   value ? new Date(value).toISOString() : new Date().toISOString();
+
+const hasStatus = (issue: Issue, statuses: readonly string[]) => statuses.includes(issue.status);
 
 /** Compare pending sets by key and value; key order is not meaningful. */
 function samePending(a: PendingMap, b: PendingMap): boolean {
@@ -72,7 +78,6 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 
 export class DecisionNotifier {
   private readonly locks = new Map<string, Promise<unknown>>();
-  private readonly prefixes = new Map<string, string>();
   /** Company the stream channel is currently opened for; emit() routes to it. */
   private openedCompanyId: string | null = null;
 
@@ -120,7 +125,8 @@ export class DecisionNotifier {
     // otherwise restore a decision the scan just saw resolved.
     await this.withLock(companyId, async () => {
       const approval = await this.ctx.approvals.get(approvalId, companyId);
-      const decision = approval && approval.status === "pending" ? await this.approvalDecision(companyId, approval) : null;
+      const decision =
+        approval && approval.status === "pending" ? this.approvalDecision(approval, await this.config(companyId)) : null;
       await this.commit(companyId, (stored) => {
         const next = { ...stored };
         const key = decisionKey("approval", approvalId);
@@ -137,9 +143,9 @@ export class DecisionNotifier {
     await this.withLock(companyId, async () => {
       const config = await this.config(companyId);
       const issue = await this.ctx.issues.get(issueId, companyId);
-      const open = issue !== null && (OPEN_ISSUE_STATUSES as readonly string[]).includes(issue.status);
-      const ownerCard = open && this.isOwnerCard(issue, config) ? await this.ownerCardDecision(companyId, issue, config) : null;
-      const interactions = open ? await this.interactionDecisions(companyId, issue, config) : {};
+      const ownerCard = issue && this.isOwnerCard(issue, config) ? this.ownerCardDecision(issue, config) : null;
+      const canHoldInteractions = issue !== null && hasStatus(issue, INTERACTION_ISSUE_STATUSES);
+      const interactions = canHoldInteractions ? await this.interactionDecisions(companyId, issue, config) : {};
       await this.commit(companyId, (stored) => {
         const next: PendingMap = {};
         for (const [key, decision] of Object.entries(stored)) {
@@ -179,12 +185,12 @@ export class DecisionNotifier {
     const config = await this.config(companyId);
     const out: PendingMap = {};
     for (const approval of await this.ctx.approvals.list({ companyId, status: "pending" })) {
-      out[decisionKey("approval", approval.id)] = await this.approvalDecision(companyId, approval);
+      out[decisionKey("approval", approval.id)] = this.approvalDecision(approval, config);
     }
-    const issues = await this.listOpenIssues(companyId);
+    const issues = await this.listIssues(companyId);
     for (const issue of issues) {
       if (this.isOwnerCard(issue, config)) {
-        out[decisionKey("owner_card", issue.id)] = await this.ownerCardDecision(companyId, issue, config);
+        out[decisionKey("owner_card", issue.id)] = this.ownerCardDecision(issue, config);
       }
     }
     const perIssue = await mapLimit(issues, INTERACTION_READ_CONCURRENCY, (issue) =>
@@ -194,19 +200,19 @@ export class DecisionNotifier {
     return out;
   }
 
-  private async listOpenIssues(companyId: string): Promise<Issue[]> {
+  private async listIssues(companyId: string): Promise<Issue[]> {
     // No limit/offset: in 2026.1023.0 the host applies `offset` twice for
     // plugin issue lists (SQL, then again in applyWindow), so page 2 is always
     // empty. Without a limit the host returns every matching row.
     const out: Issue[] = [];
-    for (const status of OPEN_ISSUE_STATUSES) {
+    for (const status of INTERACTION_ISSUE_STATUSES) {
       out.push(...(await this.ctx.issues.list({ companyId, status })));
     }
     return out;
   }
 
   private isOwnerCard(issue: Issue, config: NotifierConfig): boolean {
-    if (!issue.assigneeUserId) return false;
+    if (!issue.assigneeUserId || !hasStatus(issue, OPEN_ISSUE_STATUSES)) return false;
     return config.ownerUserIds.length === 0 || config.ownerUserIds.includes(issue.assigneeUserId);
   }
 
@@ -228,51 +234,38 @@ export class DecisionNotifier {
         id: interaction.id,
         issueId: issue.id,
         issueIdentifier: issue.identifier,
-        url: await this.issueUrl(companyId, issue, config),
+        url: this.issueUrl(issue, config),
         createdAt: isoString(interaction.createdAt),
       };
     }
     return out;
   }
 
-  private async ownerCardDecision(companyId: string, issue: Issue, config: NotifierConfig): Promise<StoredDecision> {
+  private ownerCardDecision(issue: Issue, config: NotifierConfig): StoredDecision {
     return {
       kind: "owner_card",
       id: issue.id,
       issueId: issue.id,
       issueIdentifier: issue.identifier,
-      url: await this.issueUrl(companyId, issue, config),
+      url: this.issueUrl(issue, config),
       // The card's last change is the closest available stamp for the assignment.
       createdAt: isoString(issue.updatedAt),
     };
   }
 
-  private async approvalDecision(companyId: string, approval: Approval): Promise<StoredDecision> {
-    const config = await this.config(companyId);
-    const prefix = await this.prefix(companyId);
+  private approvalDecision(approval: Approval, config: NotifierConfig): StoredDecision {
     return {
       kind: "approval",
       id: approval.id,
       issueId: null,
       issueIdentifier: null,
-      url: `${config.publicBaseUrl}/${prefix}/approvals/${encodeURIComponent(approval.id)}`,
+      url: `${config.publicBaseUrl}/${config.prefix}/approvals/${encodeURIComponent(approval.id)}`,
       createdAt: isoString(approval.createdAt),
     };
   }
 
-  private async issueUrl(companyId: string, issue: Issue, config: NotifierConfig): Promise<string> {
-    const prefix = await this.prefix(companyId);
-    return `${config.publicBaseUrl}/${prefix}/issues/${encodeURIComponent(issue.identifier ?? issue.id)}`;
-  }
-
-  private async prefix(companyId: string): Promise<string> {
-    let prefix = this.prefixes.get(companyId);
-    if (prefix === undefined) {
-      const company = await this.ctx.companies.get(companyId);
-      prefix = encodeURIComponent(company?.issuePrefix ?? companyId);
-      this.prefixes.set(companyId, prefix);
-    }
-    return prefix;
+  private issueUrl(issue: Issue, config: NotifierConfig): string {
+    return `${config.publicBaseUrl}/${config.prefix}/issues/${encodeURIComponent(issue.identifier ?? issue.id)}`;
   }
 
   private async config(companyId: string): Promise<NotifierConfig> {
@@ -281,7 +274,10 @@ export class DecisionNotifier {
     const owners = Array.isArray(raw.ownerUserIds)
       ? raw.ownerUserIds.filter((id): id is string => typeof id === "string" && id.length > 0)
       : [];
-    return { publicBaseUrl: base, ownerUserIds: owners };
+    // Read the prefix per operation, not once per worker: a company rename changes it.
+    const company = await this.ctx.companies.get(companyId);
+    const prefix = encodeURIComponent(company?.issuePrefix ?? companyId);
+    return { publicBaseUrl: base, ownerUserIds: owners, prefix };
   }
 
   private emit(companyId: string, decision: StoredDecision): void {

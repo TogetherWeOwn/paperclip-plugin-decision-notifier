@@ -92,7 +92,7 @@ describe("decision-wait", () => {
     const result = await run(fake.url, seen);
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual(decision("approval", "ap-1"));
-    expect(readFileSync(seen, "utf8")).toBe("approval:ap-1\n");
+    expect(readFileSync(seen, "utf8")).toBe("approval:ap-1:2026-10-31T12:00:00.000Z\n");
   });
 
   it("skips replayed decisions it already saw and waits for a new one", async () => {
@@ -101,12 +101,12 @@ describe("decision-wait", () => {
       later: [`data: ${JSON.stringify(decision("interaction", "ix-9"))}\n\n`],
     });
     const seen = tmpFile();
-    writeFileSync(seen, "approval:ap-1\nowner_card:resolved\n");
+    writeFileSync(seen, "approval:ap-1:2026-10-31T12:00:00.000Z\nowner_card:resolved:2026-10-31T12:00:00.000Z\n");
     const result = await run(fake.url, seen);
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).id).toBe("ix-9");
     // The resolved entry is pruned; the still-pending one is kept.
-    expect(readFileSync(seen, "utf8").split("\n").filter(Boolean).sort()).toEqual(["approval:ap-1", "interaction:ix-9"]);
+    expect(readFileSync(seen, "utf8").split("\n").filter(Boolean).sort()).toEqual(["approval:ap-1:2026-10-31T12:00:00.000Z", "interaction:ix-9:2026-10-31T12:00:00.000Z"]);
   });
 
   it("ignores frames that are not decisions", async () => {
@@ -117,6 +117,27 @@ describe("decision-wait", () => {
     const result = await run(fake.url, tmpFile());
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).id).toBe("i-1");
+  });
+
+  it("announces a card again when it starts a new pending cycle", async () => {
+    // Same card id, new createdAt: it was unassigned and reassigned between runs.
+    const reassigned = { ...decision("owner_card", "i-1"), createdAt: "2026-10-31T15:00:00.000Z" };
+    const fake = await fakePaperclip({ pending: [reassigned] });
+    const seen = tmpFile();
+    writeFileSync(seen, "owner_card:i-1:2026-10-31T12:00:00.000Z\n");
+    const result = await run(fake.url, seen);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).createdAt).toBe("2026-10-31T15:00:00.000Z");
+  });
+
+  it("parses CRLF-framed streams", async () => {
+    const fake = await fakePaperclip({
+      pending: [],
+      later: [`data: ${JSON.stringify(decision("approval", "ap-crlf"))}\r\n\r\n`],
+    });
+    const result = await run(fake.url, tmpFile());
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).id).toBe("ap-crlf");
   });
 
   it("exits 1 on an auth failure and keeps the token out of the output", async () => {

@@ -11,6 +11,7 @@
 // On connect the script asks the plugin to replay every pending decision
 // (catch-up); --seen remembers announced ones so a replay only wakes the
 // caller for new work, and entries that are no longer pending are pruned.
+// Run one waiter per --seen file; the file is not locked across processes.
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 
@@ -58,14 +59,28 @@ function parseDecision(data) {
   if (!event || typeof event !== "object") return null;
   const { kind, id, issueIdentifier, url, createdAt } = event;
   if (!KINDS.has(kind) || typeof id !== "string" || typeof url !== "string") return null;
-  return { kind, id, issueIdentifier: typeof issueIdentifier === "string" ? issueIdentifier : null, url, createdAt };
+  return {
+    kind,
+    id,
+    issueIdentifier: typeof issueIdentifier === "string" ? issueIdentifier : null,
+    url,
+    createdAt: typeof createdAt === "string" ? createdAt : null,
+  };
 }
 
+// createdAt is part of the key: an owner card that is unassigned and
+// reassigned between two runs gets a new createdAt, so it announces again.
+const seenKey = (decision) => `${decision.kind}:${decision.id}:${decision.createdAt ?? ""}`;
+
+/** Print an unseen decision; mark it seen only once stdout has taken it, then exit 0. */
 function announce(decision) {
-  const key = `${decision.kind}:${decision.id}`;
+  const key = seenKey(decision);
   if (seen.has(key)) return false;
-  if (args.seen) appendFileSync(args.seen, `${key}\n`);
-  process.stdout.write(`${JSON.stringify(decision)}\n`);
+  process.stdout.write(`${JSON.stringify(decision)}\n`, (err) => {
+    if (err) fail(`stdout write failed: ${err.message}`);
+    if (args.seen) appendFileSync(args.seen, `${key}\n`);
+    process.exit(0);
+  });
   return true;
 }
 
@@ -80,7 +95,7 @@ async function catchUp() {
   const pending = Array.isArray(body?.pending) ? body.pending.map((e) => parseDecision(JSON.stringify(e))).filter(Boolean) : [];
   if (args.seen) {
     // Forget decisions that were resolved, so they announce again if they come back.
-    const pendingKeys = new Set(pending.map((d) => `${d.kind}:${d.id}`));
+    const pendingKeys = new Set(pending.map(seenKey));
     const kept = [...readSeen()].filter((key) => pendingKeys.has(key));
     writeFileSync(args.seen, kept.length ? `${kept.join("\n")}\n` : "");
     for (const key of seen) if (!pendingKeys.has(key)) seen.delete(key);
@@ -94,10 +109,16 @@ if (!response.ok || !response.body) fail(`stream failed: HTTP ${response.status}
 
 const decoder = new TextDecoder();
 let buffer = "";
+let pendingCr = "";
 let caughtUp = false;
+let announced = false;
 for await (const chunk of response.body) {
   // SSE allows CRLF or CR line endings; the host sends LF, but normalise anyway.
-  buffer = (buffer + decoder.decode(chunk, { stream: true })).replace(/\r\n?/g, "\n");
+  // A trailing CR waits for the next chunk, in case it is the first half of CRLF.
+  let text = pendingCr + decoder.decode(chunk, { stream: true });
+  pendingCr = text.endsWith("\r") ? "\r" : "";
+  if (pendingCr) text = text.slice(0, -1);
+  buffer += text.replace(/\r\n?/g, "\n");
   let boundary;
   while ((boundary = buffer.indexOf("\n\n")) !== -1) {
     const frame = buffer.slice(0, boundary);
@@ -116,7 +137,12 @@ for await (const chunk of response.body) {
     if (type === "close") fail("stream closed by the plugin worker");
     if (type !== "message" || data.length === 0) continue;
     const decision = parseDecision(data.join("\n"));
-    if (decision && announce(decision)) process.exit(0);
+    if (decision && announce(decision)) {
+      announced = true;
+      break;
+    }
   }
+  // announce() exits once stdout has flushed; stop reading in the meantime.
+  if (announced) break;
 }
-fail("stream ended");
+if (!announced) fail("stream ended");

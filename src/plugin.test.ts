@@ -271,6 +271,25 @@ describe("review regressions", () => {
     expect(writes).toEqual([]);
   });
 
+  it("finds board interactions on backlog cards, but not backlog owner cards", async () => {
+    const { harness, ids } = await setup();
+    harness.seed({
+      issues: [issue("i-1", "TWO-1", { status: "backlog", assigneeUserId: OWNER } as Partial<Issue>)],
+      issueInteractions: [interaction("ix-1", "i-1")],
+    });
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(ids()).toEqual(["interaction:ix-1"]);
+  });
+
+  it("uses the company's current prefix after a rename", async () => {
+    const { harness } = await setup();
+    harness.seed({ approvals: [approval("ap-1")] });
+    await harness.runJob(SCAN_JOB_KEY);
+    harness.seed({ companies: [company(COMPANY, "NEW")] });
+    const response = await catchUp();
+    expect((response.body as { pending: DecisionEvent[] }).pending[0].url).toBe("/NEW/approvals/ap-1");
+  });
+
   it("refreshes URLs after a config change but keeps the first-seen createdAt", async () => {
     const { harness } = await setup({ publicBaseUrl: "https://old.example" });
     harness.seed({ issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>)] });

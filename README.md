@@ -7,7 +7,7 @@ A decision is one of:
 | kind | pending when | source |
 |---|---|---|
 | `approval` | approval status is `pending` | `approval.created` / `approval.decided` events, plus the scan job |
-| `interaction` | a thread interaction (decision card) is `pending` and not addressed to an agent | the scan job, and `issue.created` / `issue.updated` events for that card |
+| `interaction` | a thread interaction (decision card) is `pending`, not addressed to an agent, on a card that is not done or cancelled | the scan job, and `issue.created` / `issue.updated` events for that card |
 | `owner_card` | an open card (`todo`, `in_progress`, `in_review`, `blocked`) is assigned to an owner user | `issue.created` / `issue.updated` events, plus the scan job |
 
 Agent-addressed interactions are left out on purpose: Paperclip already wakes that agent.
@@ -48,7 +48,9 @@ paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-deci
 ```
 
 - The token is read from a file, never from argv.
-- `--seen` lists announced decisions. Replayed decisions already in it do not wake the caller; entries that are no longer pending are pruned on connect.
+- `--seen` lists announced decisions as `kind:id:createdAt`. Replayed decisions already in it do not wake the caller; entries that are no longer pending are pruned on connect. A card that is unassigned and reassigned gets a new `createdAt`, so it announces again. Use one waiter per `--seen` file; the file is not locked across processes.
+- A decision is marked seen only after stdout has accepted it.
+- Events are hints: a decision can resolve between the replay and your read. Re-read it from Paperclip before acting.
 - Exit 0 means a decision was printed. Exit 1 means the connection or auth failed; the reason is on stderr.
 
 ## Configuration
