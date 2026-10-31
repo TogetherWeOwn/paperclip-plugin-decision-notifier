@@ -96,7 +96,8 @@ const decoder = new TextDecoder();
 let buffer = "";
 let caughtUp = false;
 for await (const chunk of response.body) {
-  buffer += decoder.decode(chunk, { stream: true });
+  // SSE allows CRLF or CR line endings; the host sends LF, but normalise anyway.
+  buffer = (buffer + decoder.decode(chunk, { stream: true })).replace(/\r\n?/g, "\n");
   let boundary;
   while ((boundary = buffer.indexOf("\n\n")) !== -1) {
     const frame = buffer.slice(0, boundary);

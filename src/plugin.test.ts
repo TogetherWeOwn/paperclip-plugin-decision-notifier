@@ -217,6 +217,54 @@ describe("dedupe", () => {
   });
 });
 
+describe("review regressions", () => {
+  it("does not restore a decision that a concurrent scan saw resolved", async () => {
+    const { harness, ids } = await setup();
+    harness.seed({ approvals: [approval("ap-1")] });
+    await harness.runJob(SCAN_JOB_KEY);
+
+    // The approval is decided while a scan runs; the approval.created event
+    // for it is handled concurrently. The event must read after the scan.
+    let eventRead!: () => void;
+    const eventReadOrTimeout = Promise.race([
+      new Promise<void>((resolve) => (eventRead = resolve)),
+      new Promise<void>((resolve) => setTimeout(resolve, 20)),
+    ]);
+    const originalGet = harness.ctx.approvals.get.bind(harness.ctx.approvals);
+    harness.ctx.approvals.get = async (...args) => {
+      eventRead();
+      return originalGet(...args);
+    };
+    const originalList = harness.ctx.approvals.list.bind(harness.ctx.approvals);
+    harness.ctx.approvals.list = async (input) => {
+      await eventReadOrTimeout;
+      harness.seed({ approvals: [approval("ap-1", { status: "approved" } as Partial<Approval>)] });
+      return originalList(input);
+    };
+
+    const emittedBefore = ids().length;
+    await Promise.all([
+      harness.runJob(SCAN_JOB_KEY),
+      harness.emit("approval.created", {}, { companyId: COMPANY, entityId: "ap-1" }),
+    ]);
+    expect(ids().length).toBe(emittedBefore);
+    expect(harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "pending" })).toEqual({});
+  });
+
+  it("refreshes URLs after a config change but keeps the first-seen createdAt", async () => {
+    const { harness } = await setup({ publicBaseUrl: "https://old.example" });
+    harness.seed({ issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>)] });
+    await harness.runJob(SCAN_JOB_KEY);
+
+    harness.setConfig({ publicBaseUrl: "https://new.example" });
+    harness.seed({ issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER, updatedAt: new Date("2026-10-31T18:00:00Z") } as Partial<Issue>)] });
+    const response = await catchUp();
+    const [event] = (response.body as { pending: DecisionEvent[] }).pending;
+    expect(event.url).toBe("https://new.example/TWO/issues/TWO-1");
+    expect(event.createdAt).toBe("2026-10-31T10:00:00.000Z");
+  });
+});
+
 describe("catch-up", () => {
   it("replays everything still pending onto the stream and returns it", async () => {
     const { harness, emitted, ids } = await setup();

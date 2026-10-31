@@ -33,7 +33,6 @@ interface NotifierConfig {
 
 /** Statuses whose cards can hold a pending decision. Backlog, done and cancelled cards cannot. */
 export const OPEN_ISSUE_STATUSES = ["todo", "in_progress", "in_review", "blocked"] as const;
-const PAGE_SIZE = 200;
 const INTERACTION_READ_CONCURRENCY = 8;
 
 const decisionKey = (kind: DecisionKind, id: string) => `${kind}:${id}`;
@@ -93,18 +92,7 @@ export class DecisionNotifier {
     // from the stored set and re-announced by the next scan.
     return this.withLock(companyId, async () => {
       const current = await this.collect(companyId);
-      const stored = await this.load(companyId);
-      const next: PendingMap = {};
-      const fresh: StoredDecision[] = [];
-      for (const [key, decision] of Object.entries(current)) {
-        // Keep the first-seen record so createdAt stays stable across scans.
-        next[key] = stored[key] ?? decision;
-        if (!stored[key]) fresh.push(decision);
-      }
-      await this.save(companyId, next);
-      if (options.emitNew !== false) {
-        for (const decision of fresh) this.emit(companyId, decision);
-      }
+      const next = await this.commit(companyId, () => current, options.emitNew !== false);
       return Object.values(next).map(toEvent);
     });
   }
@@ -121,46 +109,63 @@ export class DecisionNotifier {
 
   async onApprovalEvent(companyId: string, approvalId: string | undefined): Promise<void> {
     if (!approvalId) return;
-    const approval = await this.ctx.approvals.get(approvalId, companyId);
-    const decision = approval && approval.status === "pending" ? await this.approvalDecision(companyId, approval) : null;
-    await this.reconcile(companyId, (map) => {
-      const key = decisionKey("approval", approvalId);
-      if (decision) map[key] ??= decision;
-      else delete map[key];
+    // Read inside the lock: a read taken before a concurrent scan could
+    // otherwise restore a decision the scan just saw resolved.
+    await this.withLock(companyId, async () => {
+      const approval = await this.ctx.approvals.get(approvalId, companyId);
+      const decision = approval && approval.status === "pending" ? await this.approvalDecision(companyId, approval) : null;
+      await this.commit(companyId, (stored) => {
+        const next = { ...stored };
+        const key = decisionKey("approval", approvalId);
+        if (decision) next[key] = decision;
+        else delete next[key];
+        return next;
+      });
     });
   }
 
   /** Re-evaluate one card: its owner assignment and its thread interactions. */
   async onIssueEvent(companyId: string, issueId: string | undefined): Promise<void> {
     if (!issueId) return;
-    const config = await this.config(companyId);
-    const issue = await this.ctx.issues.get(issueId, companyId);
-    const open = issue !== null && (OPEN_ISSUE_STATUSES as readonly string[]).includes(issue.status);
-    const ownerCard = open && this.isOwnerCard(issue, config) ? await this.ownerCardDecision(companyId, issue, config) : null;
-    const interactions = open ? await this.interactionDecisions(companyId, issue, config) : {};
-    await this.reconcile(companyId, (map) => {
-      const ownerKey = decisionKey("owner_card", issueId);
-      if (ownerCard) map[ownerKey] ??= ownerCard;
-      else delete map[ownerKey];
-      for (const [key, decision] of Object.entries(map)) {
-        if (decision.kind === "interaction" && decision.issueId === issueId && !interactions[key]) delete map[key];
-      }
-      for (const [key, decision] of Object.entries(interactions)) map[key] ??= decision;
+    await this.withLock(companyId, async () => {
+      const config = await this.config(companyId);
+      const issue = await this.ctx.issues.get(issueId, companyId);
+      const open = issue !== null && (OPEN_ISSUE_STATUSES as readonly string[]).includes(issue.status);
+      const ownerCard = open && this.isOwnerCard(issue, config) ? await this.ownerCardDecision(companyId, issue, config) : null;
+      const interactions = open ? await this.interactionDecisions(companyId, issue, config) : {};
+      await this.commit(companyId, (stored) => {
+        const next: PendingMap = {};
+        for (const [key, decision] of Object.entries(stored)) {
+          if (decision.issueId !== issueId || decision.kind === "approval") next[key] = decision;
+        }
+        if (ownerCard) next[decisionKey("owner_card", issueId)] = ownerCard;
+        Object.assign(next, interactions);
+        return next;
+      });
     });
   }
 
-  /** Apply a change to the stored set under the company lock and emit what it added. */
-  private async reconcile(companyId: string, mutate: (map: PendingMap) => void): Promise<void> {
-    await this.withLock(companyId, async () => {
-      const stored = await this.load(companyId);
-      const next: PendingMap = { ...stored };
-      mutate(next);
-      const fresh = Object.entries(next).filter(([key]) => !stored[key]).map(([, decision]) => decision);
-      const changed = fresh.length > 0 || Object.keys(stored).some((key) => !next[key]);
-      if (!changed) return;
-      await this.save(companyId, next);
-      for (const decision of fresh) this.emit(companyId, decision);
-    });
+  /**
+   * Replace the stored set with `build(stored)` and emit the decisions it adds.
+   * Fields are refreshed from the latest read (URL config may have changed);
+   * only the first-seen createdAt is kept. Call with the company lock held.
+   */
+  private async commit(
+    companyId: string,
+    build: (stored: PendingMap) => PendingMap,
+    emitNew = true,
+  ): Promise<PendingMap> {
+    const stored = await this.load(companyId);
+    const next: PendingMap = {};
+    const fresh: StoredDecision[] = [];
+    for (const [key, decision] of Object.entries(build(stored))) {
+      const previous = stored[key];
+      next[key] = previous ? { ...decision, createdAt: previous.createdAt } : decision;
+      if (!previous) fresh.push(decision);
+    }
+    if (JSON.stringify(next) !== JSON.stringify(stored)) await this.save(companyId, next);
+    if (emitNew) for (const decision of fresh) this.emit(companyId, decision);
+    return next;
   }
 
   private async collect(companyId: string): Promise<PendingMap> {
@@ -183,13 +188,12 @@ export class DecisionNotifier {
   }
 
   private async listOpenIssues(companyId: string): Promise<Issue[]> {
+    // No limit/offset: in 2026.1023.0 the host applies `offset` twice for
+    // plugin issue lists (SQL, then again in applyWindow), so page 2 is always
+    // empty. Without a limit the host returns every matching row.
     const out: Issue[] = [];
     for (const status of OPEN_ISSUE_STATUSES) {
-      for (let offset = 0; ; offset += PAGE_SIZE) {
-        const page = await this.ctx.issues.list({ companyId, status, limit: PAGE_SIZE, offset });
-        out.push(...page);
-        if (page.length < PAGE_SIZE) break;
-      }
+      out.push(...(await this.ctx.issues.list({ companyId, status })));
     }
     return out;
   }
