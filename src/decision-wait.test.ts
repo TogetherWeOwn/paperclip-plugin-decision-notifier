@@ -30,6 +30,8 @@ interface FakeOptions {
   resetAfterCatchUp?: boolean;
   /** Accept the stream request but never send response headers. */
   stallStream?: boolean;
+  /** Send the stream's response headers but never its first frame. */
+  noFirstFrame?: boolean;
   /** Accept catch-up but never answer it. */
   stallCatchUp?: boolean;
   /** Answer the stream with 501, like a host that never wires a stream bus. */
@@ -58,6 +60,10 @@ async function fakePaperclip(options: FakeOptions) {
       }
       if (options.stallStream) return;
       res.writeHead(200, { "Content-Type": "text/event-stream" });
+      if (options.noFirstFrame) {
+        res.flushHeaders();
+        return;
+      }
       res.write(":ok\n\n");
       stream = res;
       return;
@@ -228,6 +234,14 @@ describe("decision-wait", () => {
     const result = await run(fake.url, tmpFile(), TOKEN, { PAPERCLIP_DECISION_WAIT_TIMEOUT_MS: "300" });
     expect(result.code).toBe(1);
     expect(result.stderr).toBe("decision-wait: stream failed: timed out waiting for the stream\n");
+  });
+
+  it("exits 1 when the stream sends headers but no first frame", async () => {
+    const fake = await fakePaperclip({ pending: [], noFirstFrame: true });
+    const result = await run(fake.url, tmpFile(), TOKEN, { PAPERCLIP_DECISION_WAIT_TIMEOUT_MS: "300" });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toBe("decision-wait: stream failed: no frame after the headers\n");
+    expect(fake.catchUps.count).toBe(0);
   });
 
   it("exits 1 on an auth failure and keeps the token out of the output", async () => {

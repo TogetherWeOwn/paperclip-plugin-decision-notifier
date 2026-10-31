@@ -133,6 +133,8 @@ const decoder = new TextDecoder();
 let buffer = "";
 let pendingCr = "";
 let caughtUp = false;
+/** Deadline for the first frame after the headers; until it arrives, catch-up has not run. */
+let firstFrameTimer;
 
 /** Handle every complete frame in the buffer. Returns true once a decision is announced. */
 async function drainFrames() {
@@ -149,6 +151,7 @@ async function drainFrames() {
     if (!caughtUp) {
       // The server's first frame (":ok") means we are subscribed; replay now so nothing falls in a gap.
       caughtUp = true;
+      clearTimeout(firstFrameTimer);
       await catchUp();
     }
     if (type === "close") fail("stream closed by the plugin worker");
@@ -208,7 +211,7 @@ function openStream(href) {
 }
 
 const response = await openStream(`${apiBase}/api/plugins/${plugin}/bridge/stream/decisions?companyId=${company}`).catch((err) => fail(`stream failed: ${err.message}`));
-// Headers arrived: the stream may now idle for as long as no decision is pending.
+// Headers arrived: once the first frame is in, the stream may idle for as long as no decision is pending.
 const status = response.statusCode;
 if (status === 501) {
   // "Plugin stream bridge is not enabled": the host never wires a stream bus.
@@ -217,5 +220,6 @@ if (status === 501) {
   await poll();
 } else {
   if (status < 200 || status > 299) fail(`stream failed: HTTP ${status}`);
+  firstFrameTimer = setTimeout(() => fail("stream failed: no frame after the headers"), REQUEST_TIMEOUT_MS);
   await readStream(response).catch((err) => fail(`stream failed: ${err.message}`));
 }

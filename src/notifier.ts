@@ -82,8 +82,8 @@ export class DecisionNotifier {
   private readonly locks = new Map<string, Promise<unknown>>();
   /** Company the stream channel is currently opened for; emit() routes to it. */
   private openedCompanyId: string | null = null;
-  /** When each company's last catch-up scan finished, so a burst of catch-ups costs one scan. */
-  private readonly lastCatchUpScanAt = new Map<string, number>();
+  /** Each company's last catch-up scan: when it finished and the config it used. */
+  private readonly lastCatchUpScan = new Map<string, { at: number; config: string }>();
 
   constructor(private readonly ctx: PluginContext) {}
 
@@ -112,18 +112,22 @@ export class DecisionNotifier {
   /**
    * Catch-up for a client that just connected to the stream: rescan, then
    * replay every pending decision onto the stream and return the same list.
-   * Catch-ups within CATCH_UP_RESCAN_MS of the last catch-up scan reuse the
-   * stored set, which events keep current, so a client calling in a loop
-   * cannot make the worker rescan the whole company each time.
+   * Catch-ups within CATCH_UP_RESCAN_MS of the last catch-up scan, with the
+   * same config and prefix, reuse the stored set instead, so a client calling
+   * in a loop cannot make the worker rescan the whole company each time.
+   * Approval and card events keep that set current; a thread interaction has
+   * no event, so the reused set lacks one raised since the last scan until the
+   * scan job announces it.
    */
   async catchUp(companyId: string): Promise<DecisionEvent[]> {
     const pending = await this.withLock(companyId, async () => {
-      const lastScan = this.lastCatchUpScanAt.get(companyId);
-      if (lastScan !== undefined && Date.now() - lastScan < CATCH_UP_RESCAN_MS) {
+      const config = JSON.stringify(await this.config(companyId));
+      const last = this.lastCatchUpScan.get(companyId);
+      if (last && last.config === config && Date.now() - last.at < CATCH_UP_RESCAN_MS) {
         return Object.values(await this.load(companyId)).map(toEvent);
       }
       const scanned = await this.scanLocked(companyId, false);
-      this.lastCatchUpScanAt.set(companyId, Date.now());
+      this.lastCatchUpScan.set(companyId, { at: Date.now(), config });
       return scanned;
     });
     for (const event of pending) this.emitEvent(companyId, event);

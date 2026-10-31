@@ -389,6 +389,20 @@ describe("catch-up", () => {
     }
   });
 
+  it("rescans inside the window when the company prefix changed", async () => {
+    const { harness } = await setup();
+    harness.seed({ approvals: [approval("ap-1")] });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      await catchUp();
+      harness.seed({ companies: [company(COMPANY, "NEW")] });
+      const response = await catchUp();
+      expect((response.body as { pending: DecisionEvent[] }).pending[0].url).toBe("/NEW/approvals/ap-1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects unknown routes", async () => {
     await setup();
     const response = await plugin.definition.onApiRequest!({
