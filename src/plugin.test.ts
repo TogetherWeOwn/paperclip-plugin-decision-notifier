@@ -469,6 +469,164 @@ describe("no payload text", () => {
   });
 });
 
+describe("company isolation", () => {
+  const OTHER = "c-2";
+
+  it("routes each company's decisions to that company's stream", async () => {
+    const { harness, emitted, opened } = await setup();
+    harness.seed({
+      companies: [company(COMPANY, "TWO"), company(OTHER, "OTH")],
+      approvals: [approval("ap-1"), approval("ap-2", { companyId: OTHER } as Partial<Approval>)],
+      issues: [issue("i-2", "OTH-1", { companyId: OTHER, assigneeUserId: OWNER } as Partial<Issue>)],
+    });
+    await harness.runJob(SCAN_JOB_KEY);
+    // A catch-up for the first company after the scan ended on the second must reopen.
+    await catchUp(COMPANY);
+
+    const routed = emitted.map((e) => `${e.companyId}:${e.event.kind}:${e.event.id}`).sort();
+    expect(routed).toEqual([`${COMPANY}:approval:ap-1`, `${COMPANY}:approval:ap-1`, `${OTHER}:approval:ap-2`, `${OTHER}:owner_card:i-2`]);
+    expect(opened).toEqual([COMPANY, OTHER, COMPANY]);
+  });
+
+  it("keeps each company's pending set in its own state scope", async () => {
+    const { harness } = await setup();
+    harness.seed({
+      companies: [company(COMPANY), company(OTHER, "OTH")],
+      approvals: [approval("ap-1"), approval("ap-2", { companyId: OTHER } as Partial<Approval>)],
+    });
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(Object.keys(harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "pending" }) as object)).toEqual(["approval:ap-1"]);
+    expect(Object.keys(harness.getState({ scopeKind: "company", scopeId: OTHER, stateKey: "pending" }) as object)).toEqual(["approval:ap-2"]);
+  });
+});
+
+describe("error handling", () => {
+  it("keeps scanning the other companies when one company's scan throws", async () => {
+    const { harness, ids } = await setup();
+    harness.seed({
+      companies: [company("c-broken", "BRK"), company(COMPANY)],
+      approvals: [approval("ap-1")],
+    });
+    const list = harness.ctx.approvals.list.bind(harness.ctx.approvals);
+    harness.ctx.approvals.list = async (input) => {
+      if (input.companyId === "c-broken") throw new Error("host down");
+      return list(input);
+    };
+
+    await harness.runJob(SCAN_JOB_KEY);
+
+    expect(ids()).toEqual(["approval:ap-1"]);
+    expect(harness.logs).toContainEqual({
+      level: "error",
+      message: "decision scan failed",
+      meta: { companyId: "c-broken", error: "Error: host down" },
+    });
+  });
+
+  it("still handles events for a company after an earlier operation on it threw", async () => {
+    const { harness, ids } = await setup();
+    harness.seed({ approvals: [approval("ap-1"), approval("ap-2")] });
+    const get = harness.ctx.approvals.get.bind(harness.ctx.approvals);
+    let failNext = true;
+    harness.ctx.approvals.get = async (...args) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("transient");
+      }
+      return get(...args);
+    };
+
+    await expect(harness.emit("approval.created", {}, { companyId: COMPANY, entityId: "ap-1" })).rejects.toThrow("transient");
+    await harness.emit("approval.created", {}, { companyId: COMPANY, entityId: "ap-2" });
+
+    expect(ids()).toEqual(["approval:ap-2"]);
+  });
+
+});
+
+describe("issue events", () => {
+  const pending = (harness: TestHarness) =>
+    Object.keys(harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "pending" }) as object).sort();
+
+  it("drops a closed card's interactions but keeps other cards' decisions and approvals", async () => {
+    const { harness } = await setup();
+    harness.seed({
+      approvals: [approval("ap-1")],
+      issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>), issue("i-2", "TWO-2")],
+      issueInteractions: [interaction("ix-1", "i-1"), interaction("ix-2", "i-2")],
+    });
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(pending(harness)).toEqual(["approval:ap-1", "interaction:ix-1", "interaction:ix-2", "owner_card:i-1"]);
+
+    harness.seed({ issues: [issue("i-1", "TWO-1", { status: "done", assigneeUserId: OWNER } as Partial<Issue>), issue("i-2", "TWO-2")] });
+    await harness.emit("issue.updated", {}, { companyId: COMPANY, entityId: "i-1" });
+
+    expect(pending(harness)).toEqual(["approval:ap-1", "interaction:ix-2"]);
+  });
+
+  it("drops a card's decisions when the card can no longer be read", async () => {
+    const { harness } = await setup();
+    harness.seed({
+      issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>)],
+      issueInteractions: [interaction("ix-1", "i-1")],
+    });
+    await harness.runJob(SCAN_JOB_KEY);
+    harness.ctx.issues.get = async () => null;
+    await harness.emit("issue.updated", {}, { companyId: COMPANY, entityId: "i-1" });
+    expect(harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "pending" })).toEqual({});
+  });
+
+  it("announces a new board interaction found through an issue event", async () => {
+    const { harness, ids } = await setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    await harness.runJob(SCAN_JOB_KEY);
+    harness.seed({ issueInteractions: [interaction("ix-1", "i-1"), interaction("ix-agent", "i-1", { addresseeAgentId: "agent-2" } as Partial<Interaction>)] });
+    await harness.emit("issue.updated", {}, { companyId: COMPANY, entityId: "i-1" });
+    expect(ids()).toEqual(["interaction:ix-1"]);
+  });
+});
+
+describe("config and URLs", () => {
+
+  it("encodes host-supplied ids and prefixes so they cannot change the URL path", async () => {
+    const { harness } = await setup({ publicBaseUrl: "https://pc.example.com" });
+    harness.seed({
+      companies: [company(COMPANY, "A/B")],
+      approvals: [approval("../admin?x=1")],
+      issues: [issue("i-1", "TWO-1#frag", { assigneeUserId: OWNER } as Partial<Issue>)],
+    });
+    const response = await catchUp();
+    const urls = (response.body as { pending: DecisionEvent[] }).pending.map((e) => e.url).sort();
+    expect(urls).toEqual([
+      "https://pc.example.com/A%2FB/approvals/..%2Fadmin%3Fx%3D1",
+      "https://pc.example.com/A%2FB/issues/TWO-1%23frag",
+    ]);
+  });
+
+  it("falls back to the issue id and the company id when identifier and prefix are missing", async () => {
+    const { harness } = await setup();
+    harness.seed({
+      companies: [{ ...company(), issuePrefix: null } as unknown as Company],
+      issues: [issue("i-1", null as unknown as string, { assigneeUserId: OWNER } as Partial<Issue>)],
+    });
+    const response = await catchUp();
+    expect((response.body as { pending: DecisionEvent[] }).pending.map((e) => e.url)).toEqual([`/${COMPANY}/issues/i-1`]);
+  });
+});
+
+describe("route auth", () => {
+  it("serves catch-up only to board callers, scoped to the company in the body", () => {
+    expect(manifest.apiRoutes).toEqual([
+      expect.objectContaining({ routeKey: "catch-up", method: "POST", auth: "board", companyResolution: { from: "body", key: "companyId" } }),
+    ]);
+  });
+
+  it("asks for read-only host capabilities", () => {
+    const writes = manifest.capabilities.filter((c) => /write|create|update|delete|invoke|send/.test(c));
+    expect(writes).toEqual(["plugin.state.write"]);
+  });
+});
+
 describe("release", () => {
   it("advertises the package version in the manifest", () => {
     const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
