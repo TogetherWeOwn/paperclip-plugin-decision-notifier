@@ -9,7 +9,6 @@ export const RUN_FAILURE_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const RUN_FAILURE_EXCERPT_CHARS = 200;
 /** New groups per company per window; past this, further distinct failures share one overflow item. */
 export const MAX_RUN_FAILURE_GROUPS_PER_WINDOW = 5;
-const SIGNATURE_CHARS = 300;
 const REDACTED = "[redacted]";
 
 /** A failed run, as the `agent.run.failed` event and the reconciliation read both report it. */
@@ -25,29 +24,45 @@ export interface FailedRun {
   failedAt: string;
 }
 
+/** A secret value: a quoted string (through its closing quote, spaces included) or a bare word. */
+const SECRET_VALUE = String.raw`"(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|[^\s"',;&]+`;
+const SECRET_WORDS = "api[_-]?key|token|secret|password|passwd|credential|cookie|auth";
+
+/** Keeps every capture group but the last, which is the value; a quoted value keeps its quotes. */
+function redactValue(...match: string[]): string {
+  const groups = match.slice(1, -2);
+  const value = groups.pop() ?? "";
+  const quote = value[0] === '"' || value[0] === "'" ? value[0] : "";
+  const closed = quote && value.length > 1 && value.endsWith(quote) ? quote : "";
+  return `${groups.join("")}${quote}${REDACTED}${closed}`;
+}
+
 /**
  * Patterns for credentials that adapters and CLIs tend to echo into error
  * text. Order matters: the key=value rule runs before the generic long-string
  * rule so the key name survives. Over-redaction is fine; the excerpt is a hint.
  */
-const SECRET_PATTERNS: Array<[RegExp, string]> = [
+const SECRET_PATTERNS: Array<[RegExp, string | ((...match: string[]) => string)]> = [
   // Credentials in URLs: scheme://user:pass@host
   [/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, `$1${REDACTED}@`],
   // Authorization header values. A bearer value of any length is a credential.
   [/\b(bearer)\s+[A-Za-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`],
   [/\b(basic|token)\s+(?!-)[A-Za-z0-9._~+/=-]{8,}/gi, `$1 ${REDACTED}`],
-  // Space-separated CLI flags: --api-key X, --token X. Short flags such as -p are left alone.
+  // Space-separated CLI flags: --api-key X, --token "X Y". Short flags such as -p are left alone.
   [
-    /(--[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|credential|cookie|auth)[A-Za-z0-9_-]*)\s+(?!-)["']?[^\s"',;&]+/gi,
-    `$1 ${REDACTED}`,
+    new RegExp(String.raw`(--[A-Za-z0-9_-]*(?:${SECRET_WORDS})[A-Za-z0-9_-]*\s+)(?!-)(${SECRET_VALUE})`, "gi"),
+    redactValue,
   ],
   // Env-style NAME_KEY=, NAME_TOKEN=, NAME_SECRET= and bare pwd= / pass=
-  [/\b([A-Za-z0-9]+(?:_[A-Za-z0-9]+)*_(?:key|token|secret))(\s*=\s*)[^\s"',;&]+/gi, `$1$2${REDACTED}`],
-  [/(?<![A-Za-z])(pwd|pass)(["']?\s*[:=]\s*["']?)[^\s"',;&]+/gi, `$1$2${REDACTED}`],
-  // key=value and "key": "value" where the key names a secret
+  [new RegExp(String.raw`\b([A-Za-z0-9]+(?:_[A-Za-z0-9]+)*_(?:key|token|secret))(\s*=\s*)(${SECRET_VALUE})`, "gi"), redactValue],
+  [new RegExp(String.raw`(?<![A-Za-z])(pwd|pass)(["']?\s*[:=]\s*)(${SECRET_VALUE})`, "gi"), redactValue],
+  // key=value and "key": "value" where the key names a secret; an auth scheme word before the value is kept.
   [
-    /\b([A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|credential|cookie|session|auth)[A-Za-z0-9_-]*)(["']?\s*[:=]\s*["']?)[^\s"',;&]+/gi,
-    `$1$2${REDACTED}`,
+    new RegExp(
+      String.raw`\b([A-Za-z0-9_-]*(?:${SECRET_WORDS}|session)[A-Za-z0-9_-]*)(["']?\s*[:=]\s*(?:(?:basic|bearer|digest|token)\s+)?)(${SECRET_VALUE})`,
+      "gi",
+    ),
+    redactValue,
   ],
   // Well-known token formats
   [/\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{16,}/g, REDACTED],
@@ -65,7 +80,9 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
 /** Control characters become spaces, runs of whitespace collapse, then secrets are redacted. */
 export function redact(text: string): string {
   let out = text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim();
-  for (const [pattern, replacement] of SECRET_PATTERNS) out = out.replace(pattern, replacement);
+  for (const [pattern, replacement] of SECRET_PATTERNS) {
+    out = typeof replacement === "string" ? out.replace(pattern, replacement) : out.replace(pattern, replacement);
+  }
   return out;
 }
 
@@ -95,8 +112,7 @@ export function errorSignature(error: string | null): string {
     .replace(/(?<![A-Za-z0-9])(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{12,}(?![A-Za-z0-9])/g, "<id>")
     .toLowerCase()
     .replace(/\b(?=[0-9a-f]*\d)[0-9a-f]{8,}\b/g, "<hex>")
-    .replace(/\d+/g, "<n>")
-    .slice(0, SIGNATURE_CHARS);
+    .replace(/\d+/g, "<n>");
   return text || "<no error>";
 }
 

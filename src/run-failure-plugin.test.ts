@@ -282,6 +282,26 @@ describe("run failures from events", () => {
     expect(failures().map((f) => f.issueIdentifier)).toEqual([null, null]);
   });
 
+  it("drops the card identifier when the latest run in a group has no card", async () => {
+    const { fail } = await setup();
+    await fail("run-1", "2026-11-01T10:01:00.000Z");
+    await fail("run-2", "2026-11-01T10:02:00.000Z", { issueId: null });
+    const [group] = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(group).toMatchObject({ count: 2, lastRunId: "run-2", issueIdentifier: null });
+  });
+
+  it("takes the excerpt from whichever run failed first, whatever the arrival order", async () => {
+    const { fail } = await setup();
+    await fail("run-2", "2026-11-01T10:04:00.000Z");
+    await fail("run-1", "2026-11-01T10:02:00.000Z");
+    const [group] = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(group).toMatchObject({
+      firstRunId: "run-1",
+      firstFailedAt: "2026-11-01T10:02:00.000Z",
+      error: `${MODEL_ERROR} (attempt run-1)`,
+    });
+  });
+
   it("does nothing when disabled", async () => {
     const { failures, fail, harness, runs, reads } = await setup({ runFailures: { enabled: false } });
     await fail("run-1", "2026-11-01T10:01:00.000Z");
@@ -406,6 +426,48 @@ describe("run failure reconciliation", () => {
     await harness.runJob(SCAN_JOB_KEY);
     expect(reads).toEqual(["i-1", "i-1"]);
     expect(failures().map((f) => f.lastRunId)).toEqual(["run-new"]);
+  });
+
+  it("fills in a missing card identifier when the scan sees the run again", async () => {
+    const { harness, runs, fail } = await setup();
+    const real = harness.ctx.issues.get;
+    harness.ctx.issues.get = async () => {
+      throw new Error("db busy");
+    };
+    await fail("run-1", "2026-11-01T10:02:00.000Z");
+    harness.ctx.issues.get = real;
+    runs["i-1"] = [runSummary("run-1", "2026-11-01T10:02:00.000Z")];
+    await harness.runJob(SCAN_JOB_KEY);
+    const [group] = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(group).toMatchObject({ count: 1, issueIdentifier: "TWO-7" });
+  });
+
+  it("counts a run once even when the event had no error text and the scan has some", async () => {
+    const { harness, failures, runs, fail } = await setup();
+    await fail("run-1", "2026-11-01T10:02:00.000Z", { error: null });
+    runs["i-1"] = [runSummary("run-1", "2026-11-01T10:02:00.000Z")];
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(failures()).toHaveLength(1);
+    const pending = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].count).toBe(1);
+  });
+
+  it("skips backlog cards", async () => {
+    const { harness, reads } = await setup();
+    harness.seed({ issues: [issue("i-1", "TWO-7"), issue("i-back", "TWO-4", { status: "backlog" } as Partial<Issue>)] });
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(reads).toEqual(["i-1"]);
+  });
+
+  it("warns when a card's run page is full, since older runs may be unread", async () => {
+    const { harness, runs } = await setup();
+    const warn = vi.spyOn(harness.ctx.logger, "warn");
+    runs["i-1"] = Array.from({ length: 100 }, (_, n) =>
+      runSummary(`run-ok-${n}`, "2026-11-01T10:01:00.000Z", { status: "succeeded", error: null }),
+    );
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("run page full"), expect.objectContaining({ issueId: "i-1" }));
   });
 
   it("keeps its cursor when a read fails, so the next pass retries", async () => {

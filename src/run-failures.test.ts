@@ -43,6 +43,34 @@ describe("redact", () => {
     expect(out).toMatch(/\[redacted\]|\[email\]/);
   });
 
+  it.each([
+    ['password="correct horse battery staple" rejected', 'password="[redacted]" rejected'],
+    ["password='correct horse battery' rejected", "password='[redacted]' rejected"],
+    ['token: "x y z" rejected', 'token: "[redacted]" rejected'],
+    ["token: 'x y' rejected", "token: '[redacted]' rejected"],
+    ['config {"api_key": "a b c", "user": "bob"}', 'config {"api_key": "[redacted]", "user": "bob"}'],
+    ['config {"api_key": "a \\"b\\" c"}', 'config {"api_key": "[redacted]"}'],
+    ['--password "p q r" -v', '--password "[redacted]" -v'],
+    ["--password 'p q r' -v", "--password '[redacted]' -v"],
+    ['DEPLOY_TOKEN="a b c" rejected', 'DEPLOY_TOKEN="[redacted]" rejected'],
+    ["DEPLOY_TOKEN='a b c' rejected", "DEPLOY_TOKEN='[redacted]' rejected"],
+    ['mysql pwd="a b c" refused', 'mysql pwd="[redacted]" refused'],
+    ["db_pass: 'a b c' refused", "db_pass: '[redacted]' refused"],
+    ['password="truncated value with no closing quote', 'password="[redacted]'],
+  ])("redacts the whole quoted value in %j", (input, expected) => {
+    expect(redact(input)).toBe(expected);
+  });
+
+  it.each([
+    ["Authorization: Basic dTpw", "dTpw"],
+    ["Authorization: Token abc12", "abc12"],
+    ['{"authorization": "Basic dTpw"}', "dTpw"],
+  ])("redacts a short credential after an auth scheme in %j", (input, secret) => {
+    const out = redact(input);
+    expect(out).not.toContain(secret);
+    expect(out).toContain("[redacted]");
+  });
+
   it("leaves ordinary error text alone and flattens control characters", () => {
     expect(redact("line one\n\tline two\u0007  done")).toBe("line one line two done");
     expect(redact(MODEL_ERROR)).toBe(MODEL_ERROR);
@@ -111,6 +139,11 @@ describe("errorSignature", () => {
   it("keeps ordinary words and paths outside temp dirs", () => {
     expect(errorSignature("run-finished hook failed in /home/u/tmp/x")).toBe("run-finished hook failed in /home/u/tmp/x");
     expect(errorSignature("ENOENT /tmp/a")).not.toBe(errorSignature("EACCES /tmp/a"));
+  });
+
+  it("keeps errors apart that differ only after their first 300 characters", () => {
+    const prefix = "x ".repeat(200);
+    expect(errorSignature(`${prefix}ENOENT`)).not.toBe(errorSignature(`${prefix}EACCES`));
   });
 
   it("gives empty errors one shared signature", () => {

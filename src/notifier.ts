@@ -104,6 +104,8 @@ export const CATCH_UP_RESCAN_MS = 10_000;
 export const RUN_RECONCILE_INTERVAL_MS = 5 * 60_000;
 /** Each reconciliation re-reads this far before its cursor, so a run finishing mid-read is not skipped. */
 export const RUN_RECONCILE_OVERLAP_MS = 60_000;
+/** Runs `ctx.issues.summaries.getOrchestration` returns per card; it takes no paging parameter. */
+const RUN_PAGE_LIMIT = 100;
 /** Group id of the item that collects a window's distinct failures past the cap. */
 const OVERFLOW_GROUP = "overflow";
 const overflowError = (distinct: number) => `${distinct} more distinct failure${distinct === 1 ? "" : "s"}`;
@@ -277,12 +279,18 @@ export class DecisionNotifier {
     const storedCursor = await this.ctx.state.get(runCursorStateKey(companyId));
     const cursor = validIso(typeof storedCursor === "string" ? storedCursor : null);
     const since = (cursor ? Date.parse(cursor) : now - config.runFailures.windowMs) - RUN_RECONCILE_OVERLAP_MS;
-    const issues = (await this.listIssues(companyId)).filter((issue) => issue.assigneeAgentId);
+    const issues = (await this.listIssues(companyId)).filter(
+      (issue) => issue.assigneeAgentId && hasStatus(issue, OPEN_ISSUE_STATUSES),
+    );
     let complete = true;
     // Read outside the lock: this is the slow part, and recording is idempotent per run id.
     const perIssue = await mapLimit(issues, INTERACTION_READ_CONCURRENCY, async (issue) => {
       try {
         const summary = await this.ctx.issues.summaries.getOrchestration({ issueId: issue.id, companyId });
+        if (summary.runs.length >= RUN_PAGE_LIMIT) {
+          // The SDK call has no paging, so a dropped event for an older run is not recovered.
+          this.ctx.logger.warn("run page full; older runs may be unread", { companyId, issueId: issue.id, runs: summary.runs.length });
+        }
         const found: Array<{ run: FailedRun; issueIdentifier: string | null }> = [];
         for (const run of summary.runs) {
           const failedAt = validIso(run.finishedAt) ?? validIso(run.createdAt);
@@ -363,8 +371,25 @@ export class DecisionNotifier {
     }
     const groupsIn = (start: string) =>
       Object.values(next).filter((group) => group.createdAt === start && !group.groupIds).length;
+    // Run id -> group key across all groups: a run whose error text differs
+    // between the event and the scan would otherwise land in a second group.
+    const seenIn = new Map<string, string>();
+    for (const [key, group] of Object.entries(next)) for (const runId of group.runIds) seenIn.set(runId, key);
     const fresh: string[] = [];
     for (const { run, issueIdentifier } of found) {
+      const seenKey = seenIn.get(run.runId);
+      if (seenKey) {
+        // Seen before (event and scan overlap). Fill in what the first sighting lacked:
+        // only the event knows errorCode, and the event's card read may have failed.
+        const seen = next[seenKey];
+        const patch: Partial<StoredRunFailure> = {};
+        if (!seen.groupIds && run.errorCode && !seen.errorCode) patch.errorCode = run.errorCode;
+        if (seen.lastRunId === run.runId && seen.issueId === run.issueId && issueIdentifier && !seen.issueIdentifier) {
+          patch.issueIdentifier = issueIdentifier;
+        }
+        if (Object.keys(patch).length > 0) next[seenKey] = { ...seen, ...patch };
+        continue;
+      }
       const failedMs = Date.parse(run.failedAt);
       if (failedMs < cutoff) continue;
       const start = new Date(windowStart(failedMs, config.runFailures.windowMs)).toISOString();
@@ -393,12 +418,8 @@ export class DecisionNotifier {
           runIds: [run.runId],
           ...(overflow ? { groupIds: [groupId] } : {}),
         };
+        seenIn.set(run.runId, id);
         fresh.push(id);
-        continue;
-      }
-      if (group.runIds.includes(run.runId)) {
-        // Seen before (event and scan overlap). Only the event knows errorCode, so fill it in if missing.
-        if (!overflow && run.errorCode && !group.errorCode) next[id] = { ...group, errorCode: run.errorCode };
         continue;
       }
       const updated: StoredRunFailure = {
@@ -412,8 +433,10 @@ export class DecisionNotifier {
         updated.error = overflowError(updated.groupIds.length);
       }
       if (run.failedAt < group.firstFailedAt) {
+        // The earliest run owns all first-run fields, whatever the arrival order.
         updated.firstRunId = run.runId;
         updated.firstFailedAt = run.failedAt;
+        if (!updated.groupIds) updated.error = errorExcerpt(run.error);
       }
       if (run.failedAt >= group.lastFailedAt) {
         updated.agentId = run.agentId;
@@ -421,12 +444,12 @@ export class DecisionNotifier {
         updated.lastFailedAt = run.failedAt;
         updated.url = this.runUrl(run, config);
         if (!overflow) updated.errorCode = run.errorCode ?? group.errorCode;
-        if (run.issueId) {
-          updated.issueId = run.issueId;
-          updated.issueIdentifier = issueIdentifier;
-        }
+        // The card follows the latest run, including when that run has none.
+        updated.issueId = run.issueId;
+        updated.issueIdentifier = run.issueId ? issueIdentifier : null;
       }
       next[id] = updated;
+      seenIn.set(run.runId, id);
     }
     if (JSON.stringify(next) !== JSON.stringify(stored)) await this.ctx.state.set(runFailuresStateKey(companyId), next);
     for (const id of fresh) this.emitEvent(companyId, next[id]);
