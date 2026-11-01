@@ -66,7 +66,7 @@ const manifest: PaperclipPluginManifestV1 = {
       },
       runFailures: {
         type: "object",
-        description: "Announce failed and timed-out agent runs, grouped per agent, error signature and time window.",
+        description: "Announce failed and timed-out agent runs, grouped per error signature and time window across agents.",
         properties: {
           enabled: { type: "boolean", default: true, description: "Announce failed agent runs. Cancelled runs are never announced." },
           windowMinutes: {
@@ -74,7 +74,7 @@ const manifest: PaperclipPluginManifestV1 = {
             minimum: 1,
             maximum: 1440,
             default: 30,
-            description: "Failures of one agent with the same error inside one fixed window of this length become one item.",
+            description: "Failures with the same error inside one fixed window of this length become one item, whichever agents hit it.",
           },
         },
       },

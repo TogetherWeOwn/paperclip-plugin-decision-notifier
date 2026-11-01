@@ -7,6 +7,8 @@ export const MAX_RUN_FAILURE_WINDOW_MINUTES = 1440;
 /** How long a failure group stays in the pending set after its last failure. */
 export const RUN_FAILURE_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const RUN_FAILURE_EXCERPT_CHARS = 200;
+/** New groups per company per window; past this, further distinct failures share one overflow item. */
+export const MAX_RUN_FAILURE_GROUPS_PER_WINDOW = 5;
 const SIGNATURE_CHARS = 300;
 const REDACTED = "[redacted]";
 
@@ -31,15 +33,24 @@ export interface FailedRun {
 const SECRET_PATTERNS: Array<[RegExp, string]> = [
   // Credentials in URLs: scheme://user:pass@host
   [/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, `$1${REDACTED}@`],
-  // Authorization header values
-  [/\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, `$1 ${REDACTED}`],
+  // Authorization header values. A bearer value of any length is a credential.
+  [/\b(bearer)\s+[A-Za-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`],
+  [/\b(basic|token)\s+(?!-)[A-Za-z0-9._~+/=-]{8,}/gi, `$1 ${REDACTED}`],
+  // Space-separated CLI flags: --api-key X, --token X. Short flags such as -p are left alone.
+  [
+    /(--[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|credential|cookie|auth)[A-Za-z0-9_-]*)\s+(?!-)["']?[^\s"',;&]+/gi,
+    `$1 ${REDACTED}`,
+  ],
+  // Env-style NAME_KEY=, NAME_TOKEN=, NAME_SECRET= and bare pwd= / pass=
+  [/\b([A-Za-z0-9]+(?:_[A-Za-z0-9]+)*_(?:key|token|secret))(\s*=\s*)[^\s"',;&]+/gi, `$1$2${REDACTED}`],
+  [/(?<![A-Za-z])(pwd|pass)(["']?\s*[:=]\s*["']?)[^\s"',;&]+/gi, `$1$2${REDACTED}`],
   // key=value and "key": "value" where the key names a secret
   [
     /\b([A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|credential|cookie|session|auth)[A-Za-z0-9_-]*)(["']?\s*[:=]\s*["']?)[^\s"',;&]+/gi,
     `$1$2${REDACTED}`,
   ],
   // Well-known token formats
-  [/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}/g, REDACTED],
+  [/\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{16,}/g, REDACTED],
   [/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g, REDACTED],
   [/\bxox[abposr]-[A-Za-z0-9-]{10,}/g, REDACTED],
   [/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, REDACTED],
@@ -65,23 +76,36 @@ export function errorExcerpt(error: string | null): string {
 }
 
 /**
- * The part of an error that stays the same across retries: redacted,
- * lower-cased, with ids, hashes and numbers replaced by placeholders.
- * Version numbers fold too, which is fine for grouping within one agent.
+ * The part of an error that stays the same across retries: redacted, with
+ * temp paths, ids, hashes and numbers replaced by placeholders, lower-cased.
+ * Version numbers fold too, which is fine for grouping.
  */
 export function errorSignature(error: string | null): string {
   const text = redact(error ?? "")
+    // Temp paths: /tmp/paperclip-run-Xk3pQz/out.log, /var/folders/…, …\AppData\Local\Temp\…
+    .replace(/(?<![A-Za-z0-9._~-])(?:\/private)?\/(?:tmp|var\/tmp|var\/folders)\/[^\s"'),;]*/g, "<tmp>")
+    .replace(/[A-Za-z]:\\[^\s"'),;]*\\Temp\\[^\s"'),;]*/gi, "<tmp>")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<id>")
+    // Prefixed ids: req_011CUa7b3k…, msg_…, toolu_…, run_…, call_…, chatcmpl-…
+    .replace(
+      /\b(?:req|request|msg|toolu|tool|run|call|chatcmpl|cmpl|resp|evt|sess|conv|thread|file|batch|asst|job|span|trace)[_-](?=[A-Za-z0-9]*[A-Z0-9])[A-Za-z0-9]{6,}(?![A-Za-z0-9])/g,
+      "<id>",
+    )
+    // Any other token of 12+ characters mixing letters and digits, also inside snake_case
+    .replace(/(?<![A-Za-z0-9])(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{12,}(?![A-Za-z0-9])/g, "<id>")
     .toLowerCase()
-    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, "<id>")
     .replace(/\b(?=[0-9a-f]*\d)[0-9a-f]{8,}\b/g, "<hex>")
     .replace(/\d+/g, "<n>")
     .slice(0, SIGNATURE_CHARS);
   return text || "<no error>";
 }
 
-/** Stable id for one agent's failures with one signature, independent of the window. */
-export function failureGroupId(agentId: string, signature: string): string {
-  return createHash("sha256").update(`${agentId}\n${signature}`).digest("hex").slice(0, 16);
+/**
+ * Stable id for every failure with one signature, independent of agent and
+ * window, so one outage across many agents is one group.
+ */
+export function failureGroupId(signature: string): string {
+  return createHash("sha256").update(signature).digest("hex").slice(0, 16);
 }
 
 /** Start of the fixed window holding `at`. Fixed windows give the event and the scan the same key. */

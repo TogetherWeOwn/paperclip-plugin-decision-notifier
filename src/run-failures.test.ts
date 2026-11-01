@@ -26,6 +26,17 @@ describe("redact", () => {
     ["jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U", "eyJhbGciOiJIUzI1NiJ9"],
     ["notify ops@example.com about it", "ops@example.com"],
     [`blob ${"Zm9vYmFy".repeat(8)}`, "Zm9vYmFy".repeat(8)],
+    ["claude --api-key hunter2xyz -p hi", "hunter2xyz"],
+    ["gh --token abc123 api", "abc123"],
+    ["--auth-token 'q1w2e3' denied", "q1w2e3"],
+    ["ANTHROPIC_KEY=abcd1234 rejected", "abcd1234"],
+    ["DEPLOY_TOKEN = zz9-qq8 rejected", "zz9-qq8"],
+    ["MY_APP_SECRET=s3cr3t!", "s3cr3t!"],
+    ["stripe sk_live_AbCdEfGhIjKlMnOpQr declined", "sk_live_AbCdEfGhIjKlMnOpQr"],
+    ["key sk-AbCdEfGhIjKlMnOpQr rejected", "sk-AbCdEfGhIjKlMnOpQr"],
+    ["mysql pwd=hunter2 refused", "hunter2"],
+    ["db_pass: hunter2 refused", "hunter2"],
+    ["Authorization: Bearer abc", " abc"],
   ])("removes the secret from %j", (input, secret) => {
     const out = redact(input);
     expect(out).not.toContain(secret);
@@ -35,6 +46,13 @@ describe("redact", () => {
   it("leaves ordinary error text alone and flattens control characters", () => {
     expect(redact("line one\n\tline two\u0007  done")).toBe("line one line two done");
     expect(redact(MODEL_ERROR)).toBe(MODEL_ERROR);
+    expect(redact("tests passed: 3, bypass=on, --token-file ./t --verbose")).toBe("tests passed: 3, bypass=on, --token-file [redacted] --verbose");
+  });
+
+  it("keeps the flag and key names it redacts", () => {
+    expect(redact("claude --api-key hunter2xyz -p hi")).toBe("claude --api-key [redacted] -p hi");
+    expect(redact("ANTHROPIC_KEY=abcd1234 rejected")).toBe("ANTHROPIC_KEY=[redacted] rejected");
+    expect(redact("--token --verbose")).toBe("--token --verbose");
   });
 });
 
@@ -65,17 +83,47 @@ describe("errorSignature", () => {
     expect(a).not.toBe(c);
   });
 
+  const overloaded = (requestId: string, messageId: string) =>
+    `API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"${requestId}"} (${messageId})`;
+
+  it("folds the request and message ids of a 529 overloaded retry", () => {
+    const a = errorSignature(overloaded("req_011CUa7b3kZ9QwErTyUiOpAs", "msg_01XFDUDYJgAACzvnptvVoYEL"));
+    const b = errorSignature(overloaded("req_011CUb9QpLmNoPqRsTuVwXyZ", "msg_01AbCdEfGhIjKlMnOpQrStUv"));
+    expect(a).toBe(b);
+    expect(a).toContain("overloaded_error");
+    expect(a).not.toContain("req_");
+    expect(a).not.toBe(errorSignature("API Error: 401 authentication_error"));
+  });
+
+  it.each([
+    ["tool use ids", "tool toolu_01A09q90qw90lq917835lq9 failed", "tool toolu_01B77zz12ab34cd56ef78gh9 failed"],
+    ["call and run ids", "call_8fK2mQ9xLp run_Z81kq0Vb7c aborted", "call_3Hn7tRa2Wq run_A19bC4dE6f aborted"],
+    ["completion ids", "chatcmpl-9XyZ8wV7uT6s rejected", "chatcmpl-1AbC2dEf3GhI rejected"],
+    ["temp paths", "ENOENT /tmp/paperclip-run-Xk3pQz/out.log", "ENOENT /tmp/paperclip-run-Ab9TzQ/out.log"],
+    ["macOS temp paths", "cannot open /var/folders/x1/abc_def/T/run-Kq/out", "cannot open /var/folders/y7/qrs_tuv/T/run-Zp/out"],
+    ["Windows temp paths", "cannot open C:\\Users\\a\\AppData\\Local\\Temp\\pc-Xk3pQz\\x", "cannot open C:\\Users\\b\\AppData\\Local\\Temp\\pc-Q7wErT\\x"],
+    ["mixed tokens", "lease Kq7ZpX2mWv9RtY lost", "lease Bz1QnM8cLs4DfG lost"],
+    ["mixed tokens inside snake_case", "slot abc_Kq7ZpX2mWv9RtY busy", "slot abc_Bz1QnM8cLs4DfG busy"],
+  ])("folds %s", (_label, a, b) => {
+    expect(errorSignature(a)).toBe(errorSignature(b));
+  });
+
+  it("keeps ordinary words and paths outside temp dirs", () => {
+    expect(errorSignature("run-finished hook failed in /home/u/tmp/x")).toBe("run-finished hook failed in /home/u/tmp/x");
+    expect(errorSignature("ENOENT /tmp/a")).not.toBe(errorSignature("EACCES /tmp/a"));
+  });
+
   it("gives empty errors one shared signature", () => {
     expect(errorSignature(null)).toBe(errorSignature("   "));
   });
 });
 
 describe("grouping keys", () => {
-  it("keys groups by agent and signature", () => {
+  it("keys groups by signature only, so one outage across agents is one group", () => {
     const sig = errorSignature(MODEL_ERROR);
-    expect(failureGroupId("agent-1", sig)).toBe(failureGroupId("agent-1", sig));
-    expect(failureGroupId("agent-1", sig)).not.toBe(failureGroupId("agent-2", sig));
-    expect(failureGroupId("agent-1", sig)).toMatch(/^[0-9a-f]{16}$/);
+    expect(failureGroupId(sig)).toBe(failureGroupId(errorSignature(MODEL_ERROR)));
+    expect(failureGroupId(sig)).not.toBe(failureGroupId(errorSignature("spawn claude ENOENT")));
+    expect(failureGroupId(sig)).toMatch(/^[0-9a-f]{16}$/);
   });
 
   it("uses fixed windows", () => {

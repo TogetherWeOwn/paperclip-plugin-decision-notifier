@@ -88,12 +88,14 @@ function parseDecision(data) {
 
 /** Run failures add grouping fields and a redacted error excerpt (still untrusted text). */
 function parseRunFailure(decision, event) {
-  const { agentId, count, firstRunId, lastRunId, firstFailedAt, lastFailedAt, errorCode, error } = event;
+  const { agentId, agentIds, count, firstRunId, lastRunId, firstFailedAt, lastFailedAt, errorCode, error } = event;
   const str = (value) => (typeof value === "string" ? value : null);
   if (typeof agentId !== "string" || typeof lastRunId !== "string" || !Number.isInteger(count) || count < 1) return null;
+  const ids = Array.isArray(agentIds) ? agentIds.filter((id) => typeof id === "string") : [];
   return {
     ...decision,
     agentId,
+    agentIds: ids.length > 0 ? ids : [agentId],
     count,
     firstRunId: str(firstRunId) ?? lastRunId,
     lastRunId,

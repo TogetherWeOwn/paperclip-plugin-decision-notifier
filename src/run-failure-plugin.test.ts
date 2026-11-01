@@ -3,7 +3,7 @@ import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/tes
 import type { PluginIssueRunSummary } from "@paperclipai/plugin-sdk";
 import manifest, { SCAN_JOB_KEY } from "./manifest.js";
 import plugin from "./plugin.js";
-import { RUN_RECONCILE_INTERVAL_MS, type NotifierEvent, type RunFailureEvent } from "./notifier.js";
+import { RUN_RECONCILE_INTERVAL_MS, RUN_RECONCILE_OVERLAP_MS, type NotifierEvent, type RunFailureEvent } from "./notifier.js";
 
 type Seed = Parameters<TestHarness["seed"]>[0];
 type Company = NonNullable<Seed["companies"]>[number];
@@ -127,6 +127,7 @@ describe("run failures from events", () => {
         url: "https://pc.example.com/TWO/agents/agent-1/runs/run-3",
         createdAt: "2026-11-01T10:00:00.000Z",
         agentId: "agent-1",
+        agentIds: ["agent-1"],
         count: 3,
         firstRunId: "run-1",
         lastRunId: "run-3",
@@ -139,12 +140,75 @@ describe("run failures from events", () => {
     expect(first.id).toMatch(/^[0-9a-f]{16}@2026-11-01T10:00:00\.000Z$/);
   });
 
-  it("keeps different errors and different agents apart", async () => {
+  it("keeps different errors apart", async () => {
     const { failures, fail } = await setup();
     await fail("run-1", "2026-11-01T10:01:00.000Z");
     await fail("run-2", "2026-11-01T10:02:00.000Z", { error: "spawn claude ENOENT" });
-    await fail("run-3", "2026-11-01T10:03:00.000Z", { agentId: "agent-2" });
-    expect(new Set(failures().map((f) => f.id)).size).toBe(3);
+    expect(new Set(failures().map((f) => f.id)).size).toBe(2);
+  });
+
+  it("makes one item for one error across agents, listing them", async () => {
+    const { failures, fail } = await setup();
+    const error = "Reconnect or validate the selected AI account";
+    await fail("run-1", "2026-11-01T10:01:00.000Z", { error, agentId: "agent-1" });
+    await fail("run-2", "2026-11-01T10:02:00.000Z", { error, agentId: "agent-2" });
+    await fail("run-3", "2026-11-01T10:03:00.000Z", { error, agentId: "agent-3" });
+    await fail("run-4", "2026-11-01T10:04:00.000Z", { error, agentId: "agent-1" });
+    expect(failures()).toHaveLength(1);
+    const [group] = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(group).toMatchObject({
+      count: 4,
+      agentId: "agent-1",
+      agentIds: ["agent-1", "agent-2", "agent-3"],
+      lastRunId: "run-4",
+      url: "https://pc.example.com/TWO/agents/agent-1/runs/run-4",
+    });
+  });
+
+  it("groups 529 overloaded retries that differ only in request and message ids", async () => {
+    const { failures, fail } = await setup();
+    const overloaded = (requestId: string, messageId: string) =>
+      `API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"${requestId}"} ${messageId}`;
+    await fail("run-1", "2026-11-01T10:01:00.000Z", { error: overloaded("req_011CUa7b3kZ9QwErTyUiOpAs", "msg_01XFDUDYJgAACzvnptvVoYEL") });
+    await fail("run-2", "2026-11-01T10:02:00.000Z", {
+      error: overloaded("req_011CUb9QpLmNoPqRsTuVwXyZ", "msg_01AbCdEfGhIjKlMnOpQrStUv"),
+      agentId: "agent-2",
+    });
+    expect(failures()).toHaveLength(1);
+    const [group] = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(group).toMatchObject({ count: 2, agentIds: ["agent-1", "agent-2"] });
+  });
+
+  it("caps new items per window and folds the rest into one overflow item", async () => {
+    const { failures, fail } = await setup();
+    const errors = ["spawn ENOENT", "EACCES", "quota exceeded", "model not found", "bad gateway", "socket hang up", "auth failed", "disk full"];
+    for (const [i, error] of errors.entries()) {
+      await fail(`run-${i}`, `2026-11-01T10:0${i}:00.000Z`, { error, agentId: `agent-${i}` });
+    }
+    // A repeat of a capped group and of an overflowed signature: neither is a new item.
+    await fail("run-again-1", "2026-11-01T10:20:00.000Z", { error: "EACCES" });
+    await fail("run-again-7", "2026-11-01T10:21:00.000Z", { error: "disk full" });
+
+    expect(failures()).toHaveLength(6);
+    const overflowId = "overflow@2026-11-01T10:00:00.000Z";
+    expect(failures().map((f) => f.id).filter((id) => id.startsWith("overflow@"))).toEqual([overflowId]);
+    expect(failures().find((f) => f.id === overflowId)).toMatchObject({ error: "1 more distinct failure", count: 1 });
+
+    const pending = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(pending).toHaveLength(6);
+    expect(pending.find((f) => f.id === overflowId)).toMatchObject({
+      error: "3 more distinct failures",
+      errorCode: null,
+      count: 4,
+      agentIds: ["agent-5", "agent-6", "agent-7", "agent-1"],
+      lastRunId: "run-again-7",
+    });
+    expect(pending.find((f) => f.error === "EACCES")).toMatchObject({ count: 2 });
+
+    // The next window starts with a fresh allowance. (Catch-up replayed the stored items onto the stream.)
+    const replayed = failures().length;
+    await fail("run-next", "2026-11-01T10:31:00.000Z", { error: "socket hang up" });
+    expect(failures().slice(replayed)).toMatchObject([{ error: "socket hang up", createdAt: "2026-11-01T10:30:00.000Z" }]);
   });
 
   it("starts a new item in the next window", async () => {
@@ -228,6 +292,32 @@ describe("run failures from events", () => {
     expect((await catchUp()).some((e) => e.kind === "run_failure")).toBe(false);
   });
 
+  it("ignores runs older than the retention", async () => {
+    const { failures, fail } = await setup();
+    await fail("run-1", "2026-10-31T10:00:00.000Z");
+    expect(failures()).toEqual([]);
+  });
+
+  it("prunes stored groups 24 hours after their last failure", async () => {
+    const { harness, fail } = await setup();
+    const stored = () =>
+      Object.keys(harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "run-failures" }) as object);
+    await fail("run-1", "2026-11-01T10:01:00.000Z");
+    const [oldId] = stored();
+    advance(24 * 60 * 60_000);
+    await fail("run-2", "2026-11-02T10:05:00.000Z");
+    expect(stored()).toHaveLength(1);
+    expect(stored()).not.toContain(oldId);
+  });
+
+  it("stops replaying stored groups once disabled", async () => {
+    const { harness, fail } = await setup();
+    await fail("run-1", "2026-11-01T10:01:00.000Z");
+    expect((await catchUp()).some((e) => e.kind === "run_failure")).toBe(true);
+    harness.setConfig({ publicBaseUrl: "https://pc.example.com", runFailures: { enabled: false } });
+    expect((await catchUp()).some((e) => e.kind === "run_failure")).toBe(false);
+  });
+
   it("drops groups from catch-up 24 hours after their last failure", async () => {
     const { fail } = await setup();
     await fail("run-1", "2026-11-01T10:01:00.000Z");
@@ -266,6 +356,30 @@ describe("run failure reconciliation", () => {
     expect(failures()).toHaveLength(1);
     const [group] = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
     expect(group).toMatchObject({ count: 2, lastRunId: "run-2", errorCode: "adapter_failed" });
+  });
+
+  it("fills in the error code when the event arrives after the reconciliation", async () => {
+    const { harness, failures, runs, fail } = await setup();
+    runs["i-1"] = [runSummary("run-1", "2026-11-01T10:02:00.000Z")];
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(failures()[0].errorCode).toBeNull();
+    await fail("run-1", "2026-11-01T10:02:00.000Z");
+    expect(failures()).toHaveLength(1);
+    const [group] = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(group).toMatchObject({ count: 1, errorCode: "adapter_failed" });
+  });
+
+  it("re-reads the overlap before its cursor, so a run that finished mid-read is counted", async () => {
+    const { harness, failures, runs } = await setup();
+    await harness.runJob(SCAN_JOB_KEY);
+    // Both finished before the cursor (NOW) but were not visible to the first pass.
+    runs["i-1"] = [
+      runSummary("run-mid-read", new Date(NOW - RUN_RECONCILE_OVERLAP_MS / 2).toISOString()),
+      runSummary("run-too-old", new Date(NOW - RUN_RECONCILE_OVERLAP_MS * 2).toISOString(), { error: "too old" }),
+    ];
+    advance(RUN_RECONCILE_INTERVAL_MS);
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(failures().map((f) => f.lastRunId)).toEqual(["run-mid-read"]);
   });
 
   it("only reads agent-assigned open cards, at most once per interval, and only runs since its cursor", async () => {
@@ -328,11 +442,15 @@ describe("existing kinds", () => {
 
   it("never leaks stored-only fields", async () => {
     const { emitted, fail } = await setup();
-    await fail("run-1", "2026-11-01T10:01:00.000Z");
+    for (const [i, error] of ["a", "b", "c", "d", "e", "f"].entries()) {
+      await fail(`run-${i}`, "2026-11-01T10:01:00.000Z", { error: `error ${error}` });
+    }
     const pending = await catchUp();
+    expect(pending.some((e) => e.id.startsWith("overflow@"))).toBe(true);
     for (const event of [...emitted, ...pending]) {
       expect(event).not.toHaveProperty("runIds");
       expect(event).not.toHaveProperty("issueId");
+      expect(event).not.toHaveProperty("groupIds");
     }
   });
 

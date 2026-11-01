@@ -389,6 +389,7 @@ describe("decision-wait run failures", () => {
     url: "/TWO/agents/agent-1/runs/run-3",
     createdAt: "2026-11-01T10:00:00.000Z",
     agentId: "agent-1",
+    agentIds: ["agent-1", "agent-2"],
     count: 3,
     firstRunId: "run-1",
     lastRunId: "run-3",
@@ -425,6 +426,18 @@ describe("decision-wait run failures", () => {
     const result = await run(fake.url, tmpFile());
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({ ...failure, error: "x".repeat(200) });
+  });
+
+  it("keeps only string agent ids and falls back to the latest agent", async () => {
+    const fake = await fakePaperclip({
+      pending: [],
+      later: [`data: ${JSON.stringify({ ...failure, agentIds: [7, "agent-2", { x: 1 }] })}\n\n`],
+    });
+    const result = await run(fake.url, tmpFile());
+    expect(JSON.parse(result.stdout).agentIds).toEqual(["agent-2"]);
+    const legacy = await fakePaperclip({ pending: [], later: [`data: ${JSON.stringify({ ...failure, agentIds: undefined })}\n\n`] });
+    const legacyResult = await run(legacy.url, tmpFile());
+    expect(JSON.parse(legacyResult.stdout).agentIds).toEqual(["agent-1"]);
   });
 
   it("ignores run failures without an agent, a last run or a positive count", async () => {

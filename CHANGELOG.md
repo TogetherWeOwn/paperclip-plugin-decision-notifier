@@ -2,7 +2,7 @@
 
 ## 0.2.0
 
-- New `run_failure` kind: failed and timed-out agent runs, grouped per agent, normalised error signature and fixed window (`runFailures.windowMinutes`, default 30). Each group is announced once and carries `count`, first and last run IDs and times, the card identifier, `errorCode` when known, and a redacted error excerpt of at most 200 characters. Cancelled runs are never announced.
+- New `run_failure` kind: failed and timed-out agent runs, grouped per normalised error signature and fixed window across agents (`runFailures.windowMinutes`, default 30). Each group is announced once and carries `count`, the agents involved (`agentIds`), first and last run IDs and times, the card identifier, `errorCode` when known, and a redacted error excerpt of at most 200 characters. At most 5 groups per company per window; further distinct failures share one overflow item. Cancelled runs are never announced.
 - Sources: the `agent.run.failed` plugin event, plus a reconciliation in the scan job (every 5 minutes, cursor-based) that reads the runs of open agent-assigned cards, so a dropped event is still caught. Run IDs dedupe the two.
 - Catch-up replays run failure groups from the last 24 hours alongside pending decisions.
 - New config `runFailures.enabled` (default `true`) and `runFailures.windowMinutes`. New capability `issues.orchestration.read`.

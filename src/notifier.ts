@@ -2,6 +2,7 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { STREAM_CHANNEL } from "./manifest.js";
 import {
   DEFAULT_RUN_FAILURE_WINDOW_MINUTES,
+  MAX_RUN_FAILURE_GROUPS_PER_WINDOW,
   MAX_RUN_FAILURE_WINDOW_MINUTES,
   RUN_FAILURE_RETENTION_MS,
   RUN_FAILURE_STATUSES,
@@ -34,20 +35,28 @@ export interface DecisionEvent {
 }
 
 /**
- * Failed agent runs, grouped per (agent, error signature, fixed window). The
- * one event kind that carries text: `error` is a redacted excerpt of at most
- * 200 characters. It is still untrusted, so re-read the run before acting.
+ * Failed agent runs, grouped per (error signature, fixed window) across all
+ * agents, so one outage is one item. The one event kind that carries text:
+ * `error` is a redacted excerpt of at most 200 characters. It is still
+ * untrusted, so re-read the run before acting.
  */
 export interface RunFailureEvent {
   kind: "run_failure";
-  /** `<group id>@<window start>`: one id per agent, error signature and window. */
+  /**
+   * `<group id>@<window start>`: one id per error signature and window. Past
+   * the per-window cap, `overflow@<window start>` collects the remaining
+   * distinct failures of that window.
+   */
   id: string;
   issueIdentifier: string | null;
   /** The latest failed run in the group. */
   url: string;
   /** Window start; stable for the group, so dedupe on kind + id + createdAt works as for decisions. */
   createdAt: string;
+  /** Agent of the latest failed run. */
   agentId: string;
+  /** Every agent with a failed run in the group, in first-seen order. */
+  agentIds: string[];
   count: number;
   firstRunId: string;
   lastRunId: string;
@@ -63,6 +72,8 @@ interface StoredRunFailure extends RunFailureEvent {
   issueId: string | null;
   /** Every run counted, so the event and the scan never count one run twice. */
   runIds: string[];
+  /** Overflow item only: the signature groups it stands in for. */
+  groupIds?: string[];
 }
 
 type RunFailureMap = Record<string, StoredRunFailure>;
@@ -92,7 +103,10 @@ export const CATCH_UP_RESCAN_MS = 10_000;
 /** Failed runs are reconciled at most this often per company; the cursor makes the interval lossless. */
 export const RUN_RECONCILE_INTERVAL_MS = 5 * 60_000;
 /** Each reconciliation re-reads this far before its cursor, so a run finishing mid-read is not skipped. */
-const RUN_RECONCILE_OVERLAP_MS = 60_000;
+export const RUN_RECONCILE_OVERLAP_MS = 60_000;
+/** Group id of the item that collects a window's distinct failures past the cap. */
+const OVERFLOW_GROUP = "overflow";
+const overflowError = (distinct: number) => `${distinct} more distinct failure${distinct === 1 ? "" : "s"}`;
 
 const decisionKey = (kind: DecisionKind, id: string) => `${kind}:${id}`;
 const companyStateKey = (companyId: string, stateKey: string) => ({
@@ -110,9 +124,24 @@ export function toEvent(decision: DecisionEvent): DecisionEvent {
 }
 
 export function toRunFailureEvent(group: RunFailureEvent): RunFailureEvent {
-  const { kind, id, issueIdentifier, url, createdAt, agentId, count, firstRunId, lastRunId, firstFailedAt, lastFailedAt, errorCode, error } =
+  const { kind, id, issueIdentifier, url, createdAt, agentId, agentIds, count, firstRunId, lastRunId, firstFailedAt, lastFailedAt, errorCode, error } =
     group;
-  return { kind, id, issueIdentifier, url, createdAt, agentId, count, firstRunId, lastRunId, firstFailedAt, lastFailedAt, errorCode, error };
+  return {
+    kind,
+    id,
+    issueIdentifier,
+    url,
+    createdAt,
+    agentId,
+    agentIds,
+    count,
+    firstRunId,
+    lastRunId,
+    firstFailedAt,
+    lastFailedAt,
+    errorCode,
+    error,
+  };
 }
 
 /** The public form of any stored item. */
@@ -317,7 +346,9 @@ export class DecisionNotifier {
   /**
    * Add failed runs to their groups, drop groups past retention, and emit the
    * groups this call created. A group is announced once; later runs only
-   * raise its count. Call with the company lock held.
+   * raise its count. A window holds at most MAX_RUN_FAILURE_GROUPS_PER_WINDOW
+   * groups; further distinct failures go to one overflow item for the window.
+   * Call with the company lock held.
    */
   private async recordRunFailures(
     companyId: string,
@@ -330,12 +361,16 @@ export class DecisionNotifier {
     for (const [key, group] of Object.entries(stored)) {
       if (Date.parse(group.lastFailedAt) >= cutoff) next[key] = group;
     }
+    const groupsIn = (start: string) =>
+      Object.values(next).filter((group) => group.createdAt === start && !group.groupIds).length;
     const fresh: string[] = [];
     for (const { run, issueIdentifier } of found) {
       const failedMs = Date.parse(run.failedAt);
       if (failedMs < cutoff) continue;
       const start = new Date(windowStart(failedMs, config.runFailures.windowMs)).toISOString();
-      const id = `${failureGroupId(run.agentId, errorSignature(run.error))}@${start}`;
+      const groupId = failureGroupId(errorSignature(run.error));
+      const overflow = !next[`${groupId}@${start}`] && groupsIn(start) >= MAX_RUN_FAILURE_GROUPS_PER_WINDOW;
+      const id = `${overflow ? OVERFLOW_GROUP : groupId}@${start}`;
       const group = next[id];
       if (!group) {
         next[id] = {
@@ -346,33 +381,46 @@ export class DecisionNotifier {
           url: this.runUrl(run, config),
           createdAt: start,
           agentId: run.agentId,
+          agentIds: [run.agentId],
           count: 1,
           firstRunId: run.runId,
           lastRunId: run.runId,
           firstFailedAt: run.failedAt,
           lastFailedAt: run.failedAt,
-          errorCode: run.errorCode,
-          error: errorExcerpt(run.error),
+          // The overflow item mixes errors, so it has no single code or excerpt.
+          errorCode: overflow ? null : run.errorCode,
+          error: overflow ? overflowError(1) : errorExcerpt(run.error),
           runIds: [run.runId],
+          ...(overflow ? { groupIds: [groupId] } : {}),
         };
         fresh.push(id);
         continue;
       }
       if (group.runIds.includes(run.runId)) {
         // Seen before (event and scan overlap). Only the event knows errorCode, so fill it in if missing.
-        if (run.errorCode && !group.errorCode) next[id] = { ...group, errorCode: run.errorCode };
+        if (!overflow && run.errorCode && !group.errorCode) next[id] = { ...group, errorCode: run.errorCode };
         continue;
       }
-      const updated: StoredRunFailure = { ...group, count: group.count + 1, runIds: [...group.runIds, run.runId] };
+      const updated: StoredRunFailure = {
+        ...group,
+        agentIds: group.agentIds.includes(run.agentId) ? group.agentIds : [...group.agentIds, run.agentId],
+        count: group.count + 1,
+        runIds: [...group.runIds, run.runId],
+      };
+      if (group.groupIds && !group.groupIds.includes(groupId)) {
+        updated.groupIds = [...group.groupIds, groupId];
+        updated.error = overflowError(updated.groupIds.length);
+      }
       if (run.failedAt < group.firstFailedAt) {
         updated.firstRunId = run.runId;
         updated.firstFailedAt = run.failedAt;
       }
       if (run.failedAt >= group.lastFailedAt) {
+        updated.agentId = run.agentId;
         updated.lastRunId = run.runId;
         updated.lastFailedAt = run.failedAt;
         updated.url = this.runUrl(run, config);
-        updated.errorCode = run.errorCode ?? group.errorCode;
+        if (!overflow) updated.errorCode = run.errorCode ?? group.errorCode;
         if (run.issueId) {
           updated.issueId = run.issueId;
           updated.issueIdentifier = issueIdentifier;
