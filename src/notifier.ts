@@ -1,11 +1,26 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { STREAM_CHANNEL } from "./manifest.js";
+import {
+  DEFAULT_RUN_FAILURE_WINDOW_MINUTES,
+  MAX_RUN_FAILURE_GROUPS_PER_WINDOW,
+  MAX_RUN_FAILURE_WINDOW_MINUTES,
+  RUN_FAILURE_RETENTION_MS,
+  RUN_FAILURE_STATUSES,
+  errorExcerpt,
+  errorSignature,
+  failedRunFromEvent,
+  failureGroupId,
+  validIso,
+  windowStart,
+  type FailedRun,
+} from "./run-failures.js";
 
 type Issue = Awaited<ReturnType<PluginContext["issues"]["list"]>>[number];
 type Interaction = Awaited<ReturnType<PluginContext["issues"]["listInteractions"]>>[number];
 type Approval = Awaited<ReturnType<PluginContext["approvals"]["list"]>>[number];
 
 export type DecisionKind = "approval" | "interaction" | "owner_card";
+export type EventKind = DecisionKind | "run_failure";
 
 /**
  * The only shape that ever leaves the plugin. IDs and URLs only: titles,
@@ -19,6 +34,50 @@ export interface DecisionEvent {
   createdAt: string;
 }
 
+/**
+ * Failed agent runs, grouped per (error signature, fixed window) across all
+ * agents, so one outage is one item. The one event kind that carries text:
+ * `error` is a redacted excerpt of at most 200 characters. It is still
+ * untrusted, so re-read the run before acting.
+ */
+export interface RunFailureEvent {
+  kind: "run_failure";
+  /**
+   * `<group id>@<window start>`: one id per error signature and window. Past
+   * the per-window cap, `overflow@<window start>` collects the remaining
+   * distinct failures of that window.
+   */
+  id: string;
+  issueIdentifier: string | null;
+  /** The latest failed run in the group. */
+  url: string;
+  /** Window start; stable for the group, so dedupe on kind + id + createdAt works as for decisions. */
+  createdAt: string;
+  /** Agent of the latest failed run. */
+  agentId: string;
+  /** Every agent with a failed run in the group, in first-seen order. */
+  agentIds: string[];
+  count: number;
+  firstRunId: string;
+  lastRunId: string;
+  firstFailedAt: string;
+  lastFailedAt: string;
+  errorCode: string | null;
+  error: string;
+}
+
+export type NotifierEvent = DecisionEvent | RunFailureEvent;
+
+interface StoredRunFailure extends RunFailureEvent {
+  issueId: string | null;
+  /** Every run counted, so the event and the scan never count one run twice. */
+  runIds: string[];
+  /** Overflow item only: the signature groups it stands in for. */
+  groupIds?: string[];
+}
+
+type RunFailureMap = Record<string, StoredRunFailure>;
+
 /** Stored form: the public event plus the issue it belongs to, for per-issue reconciliation. */
 interface StoredDecision extends DecisionEvent {
   issueId: string | null;
@@ -31,6 +90,7 @@ interface NotifierConfig {
   publicBaseUrl: string;
   ownerUserIds: string[];
   prefix: string;
+  runFailures: { enabled: boolean; windowMs: number };
 }
 
 /** Statuses where an owner-assigned card counts as a decision. */
@@ -40,17 +100,55 @@ export const INTERACTION_ISSUE_STATUSES = ["backlog", ...OPEN_ISSUE_STATUSES] as
 const INTERACTION_READ_CONCURRENCY = 8;
 /** A catch-up this soon after the previous catch-up scan replays the stored set instead of rescanning. */
 export const CATCH_UP_RESCAN_MS = 10_000;
+/** Failed runs are reconciled at most this often per company; the cursor makes the interval lossless. */
+export const RUN_RECONCILE_INTERVAL_MS = 5 * 60_000;
+/** Each reconciliation re-reads this far before its cursor, so a run finishing mid-read is not skipped. */
+export const RUN_RECONCILE_OVERLAP_MS = 60_000;
+/** Runs `ctx.issues.summaries.getOrchestration` returns per card; it takes no paging parameter. */
+const RUN_PAGE_LIMIT = 100;
+/** Group id of the item that collects a window's distinct failures past the cap. */
+const OVERFLOW_GROUP = "overflow";
+const overflowError = (distinct: number) => `${distinct} more distinct failure${distinct === 1 ? "" : "s"}`;
 
 const decisionKey = (kind: DecisionKind, id: string) => `${kind}:${id}`;
-const pendingStateKey = (companyId: string) => ({
+const companyStateKey = (companyId: string, stateKey: string) => ({
   scopeKind: "company" as const,
   scopeId: companyId,
-  stateKey: "pending",
+  stateKey,
 });
+const pendingStateKey = (companyId: string) => companyStateKey(companyId, "pending");
+const runFailuresStateKey = (companyId: string) => companyStateKey(companyId, "run-failures");
+const runCursorStateKey = (companyId: string) => companyStateKey(companyId, "run-failure-cursor");
 
 export function toEvent(decision: DecisionEvent): DecisionEvent {
   const { kind, id, issueIdentifier, url, createdAt } = decision;
   return { kind, id, issueIdentifier, url, createdAt };
+}
+
+export function toRunFailureEvent(group: RunFailureEvent): RunFailureEvent {
+  const { kind, id, issueIdentifier, url, createdAt, agentId, agentIds, count, firstRunId, lastRunId, firstFailedAt, lastFailedAt, errorCode, error } =
+    group;
+  return {
+    kind,
+    id,
+    issueIdentifier,
+    url,
+    createdAt,
+    agentId,
+    agentIds,
+    count,
+    firstRunId,
+    lastRunId,
+    firstFailedAt,
+    lastFailedAt,
+    errorCode,
+    error,
+  };
+}
+
+/** The public form of any stored item. */
+export function toPublic(item: NotifierEvent): NotifierEvent {
+  return item.kind === "run_failure" ? toRunFailureEvent(item) : toEvent(item);
 }
 
 const isoString = (value: Date | string | null | undefined): string =>
@@ -84,10 +182,12 @@ export class DecisionNotifier {
   private openedCompanyId: string | null = null;
   /** Each company's last catch-up scan: when it finished and the config it used. */
   private readonly lastCatchUpScan = new Map<string, { at: number; config: string }>();
+  /** When each company's failed runs were last reconciled. */
+  private readonly lastRunReconcile = new Map<string, number>();
 
   constructor(private readonly ctx: PluginContext) {}
 
-  /** Reconcile every company. One failing company does not stop the others. */
+  /** Reconcile every company. One failing company, or one failing part, does not stop the others. */
   async scanAll(): Promise<void> {
     const companies = await this.ctx.companies.list();
     for (const company of companies) {
@@ -95,6 +195,11 @@ export class DecisionNotifier {
         await this.scanCompany(company.id);
       } catch (err) {
         this.ctx.logger.error("decision scan failed", { companyId: company.id, error: String(err) });
+      }
+      try {
+        await this.reconcileRunFailures(company.id);
+      } catch (err) {
+        this.ctx.logger.error("run failure reconciliation failed", { companyId: company.id, error: String(err) });
       }
     }
   }
@@ -117,23 +222,94 @@ export class DecisionNotifier {
    * in a loop cannot make the worker rescan the whole company each time.
    * Approval and card events keep that set current; a thread interaction has
    * no event, so the reused set lacks one raised since the last scan until the
-   * scan job announces it.
+   * scan job announces it. Run failure groups still within their retention
+   * are replayed too; they are kept current by events and the scan job.
    */
-  async catchUp(companyId: string): Promise<DecisionEvent[]> {
+  async catchUp(companyId: string): Promise<NotifierEvent[]> {
     const pending = await this.withLock(companyId, async () => {
-      const config = JSON.stringify(await this.config(companyId));
+      const config = await this.config(companyId);
+      const configKey = JSON.stringify(config);
       const last = this.lastCatchUpScan.get(companyId);
       // A negative age means the clock moved back; rescan rather than trust the window.
       const age = last ? Date.now() - last.at : -1;
-      if (last && last.config === config && age >= 0 && age < CATCH_UP_RESCAN_MS) {
-        return Object.values(await this.load(companyId)).map(toEvent);
+      let decisions: DecisionEvent[];
+      if (last && last.config === configKey && age >= 0 && age < CATCH_UP_RESCAN_MS) {
+        decisions = Object.values(await this.load(companyId)).map(toEvent);
+      } else {
+        decisions = await this.scanLocked(companyId, false);
+        this.lastCatchUpScan.set(companyId, { at: Date.now(), config: configKey });
       }
-      const scanned = await this.scanLocked(companyId, false);
-      this.lastCatchUpScan.set(companyId, { at: Date.now(), config });
-      return scanned;
+      const cutoff = Date.now() - RUN_FAILURE_RETENTION_MS;
+      const failures = config.runFailures.enabled
+        ? Object.values(await this.loadRunFailures(companyId))
+            .filter((group) => Date.parse(group.lastFailedAt) >= cutoff)
+            .map(toRunFailureEvent)
+        : [];
+      return [...decisions, ...failures];
     });
     for (const event of pending) this.emitEvent(companyId, event);
     return pending;
+  }
+
+  /** Count one failed run from an `agent.run.failed` event. Cancelled runs never get here. */
+  async onRunFailedEvent(companyId: string, payload: unknown, occurredAt: string, entityId?: string): Promise<void> {
+    const run = failedRunFromEvent(payload, occurredAt, entityId);
+    if (!run) return;
+    await this.withLock(companyId, async () => {
+      const config = await this.config(companyId);
+      if (!config.runFailures.enabled) return;
+      // A card the plugin cannot read still gets its failure announced, just without an identifier.
+      const issue = run.issueId ? await this.ctx.issues.get(run.issueId, companyId).catch(() => null) : null;
+      await this.recordRunFailures(companyId, [{ run, issueIdentifier: issue?.identifier ?? null }], config);
+    });
+  }
+
+  /**
+   * Safety net for dropped `agent.run.failed` events: read the runs of every
+   * open agent-assigned card and count failures since the last cursor. Runs at
+   * most once per RUN_RECONCILE_INTERVAL_MS; the cursor only advances after a
+   * complete read, and run ids dedupe the overlap with events.
+   */
+  async reconcileRunFailures(companyId: string): Promise<void> {
+    const now = Date.now();
+    const last = this.lastRunReconcile.get(companyId);
+    if (last !== undefined && now - last >= 0 && now - last < RUN_RECONCILE_INTERVAL_MS) return;
+    const config = await this.config(companyId);
+    if (!config.runFailures.enabled) return;
+    const storedCursor = await this.ctx.state.get(runCursorStateKey(companyId));
+    const cursor = validIso(typeof storedCursor === "string" ? storedCursor : null);
+    const since = (cursor ? Date.parse(cursor) : now - config.runFailures.windowMs) - RUN_RECONCILE_OVERLAP_MS;
+    const issues = (await this.listIssues(companyId)).filter(
+      (issue) => issue.assigneeAgentId && hasStatus(issue, OPEN_ISSUE_STATUSES),
+    );
+    let complete = true;
+    // Read outside the lock: this is the slow part, and recording is idempotent per run id.
+    const perIssue = await mapLimit(issues, INTERACTION_READ_CONCURRENCY, async (issue) => {
+      try {
+        const summary = await this.ctx.issues.summaries.getOrchestration({ issueId: issue.id, companyId });
+        if (summary.runs.length >= RUN_PAGE_LIMIT) {
+          // The SDK call has no paging, so a dropped event for an older run is not recovered.
+          this.ctx.logger.warn("run page full; older runs may be unread", { companyId, issueId: issue.id, runs: summary.runs.length });
+        }
+        const found: Array<{ run: FailedRun; issueIdentifier: string | null }> = [];
+        for (const run of summary.runs) {
+          const failedAt = validIso(run.finishedAt) ?? validIso(run.createdAt);
+          if (!RUN_FAILURE_STATUSES.includes(run.status) || !failedAt || Date.parse(failedAt) < since) continue;
+          found.push({
+            run: { runId: run.id, agentId: run.agentId, status: run.status, error: run.error, errorCode: null, issueId: issue.id, failedAt },
+            issueIdentifier: issue.identifier,
+          });
+        }
+        return found;
+      } catch (err) {
+        complete = false;
+        this.ctx.logger.warn("run read failed", { companyId, issueId: issue.id, error: String(err) });
+        return [];
+      }
+    });
+    await this.withLock(companyId, () => this.recordRunFailures(companyId, perIssue.flat(), config));
+    if (complete) await this.ctx.state.set(runCursorStateKey(companyId), new Date(now).toISOString());
+    this.lastRunReconcile.set(companyId, now);
   }
 
   async onApprovalEvent(companyId: string, approvalId: string | undefined): Promise<void> {
@@ -173,6 +349,110 @@ export class DecisionNotifier {
         return next;
       });
     });
+  }
+
+  /**
+   * Add failed runs to their groups, drop groups past retention, and emit the
+   * groups this call created. A group is announced once; later runs only
+   * raise its count. A window holds at most MAX_RUN_FAILURE_GROUPS_PER_WINDOW
+   * groups; further distinct failures go to one overflow item for the window.
+   * Call with the company lock held.
+   */
+  private async recordRunFailures(
+    companyId: string,
+    found: Array<{ run: FailedRun; issueIdentifier: string | null }>,
+    config: NotifierConfig,
+  ): Promise<void> {
+    const stored = await this.loadRunFailures(companyId);
+    const cutoff = Date.now() - RUN_FAILURE_RETENTION_MS;
+    const next: RunFailureMap = {};
+    for (const [key, group] of Object.entries(stored)) {
+      if (Date.parse(group.lastFailedAt) >= cutoff) next[key] = group;
+    }
+    const groupsIn = (start: string) =>
+      Object.values(next).filter((group) => group.createdAt === start && !group.groupIds).length;
+    // Run id -> group key across all groups: a run whose error text differs
+    // between the event and the scan would otherwise land in a second group.
+    const seenIn = new Map<string, string>();
+    for (const [key, group] of Object.entries(next)) for (const runId of group.runIds) seenIn.set(runId, key);
+    const fresh: string[] = [];
+    for (const { run, issueIdentifier } of found) {
+      const seenKey = seenIn.get(run.runId);
+      if (seenKey) {
+        // Seen before (event and scan overlap). Fill in what the first sighting lacked:
+        // only the event knows errorCode, and the event's card read may have failed.
+        const seen = next[seenKey];
+        const patch: Partial<StoredRunFailure> = {};
+        if (!seen.groupIds && run.errorCode && !seen.errorCode) patch.errorCode = run.errorCode;
+        if (seen.lastRunId === run.runId && seen.issueId === run.issueId && issueIdentifier && !seen.issueIdentifier) {
+          patch.issueIdentifier = issueIdentifier;
+        }
+        if (Object.keys(patch).length > 0) next[seenKey] = { ...seen, ...patch };
+        continue;
+      }
+      const failedMs = Date.parse(run.failedAt);
+      if (failedMs < cutoff) continue;
+      const start = new Date(windowStart(failedMs, config.runFailures.windowMs)).toISOString();
+      const groupId = failureGroupId(errorSignature(run.error));
+      const overflow = !next[`${groupId}@${start}`] && groupsIn(start) >= MAX_RUN_FAILURE_GROUPS_PER_WINDOW;
+      const id = `${overflow ? OVERFLOW_GROUP : groupId}@${start}`;
+      const group = next[id];
+      if (!group) {
+        next[id] = {
+          kind: "run_failure",
+          id,
+          issueId: run.issueId,
+          issueIdentifier,
+          url: this.runUrl(run, config),
+          createdAt: start,
+          agentId: run.agentId,
+          agentIds: [run.agentId],
+          count: 1,
+          firstRunId: run.runId,
+          lastRunId: run.runId,
+          firstFailedAt: run.failedAt,
+          lastFailedAt: run.failedAt,
+          // The overflow item mixes errors, so it has no single code or excerpt.
+          errorCode: overflow ? null : run.errorCode,
+          error: overflow ? overflowError(1) : errorExcerpt(run.error),
+          runIds: [run.runId],
+          ...(overflow ? { groupIds: [groupId] } : {}),
+        };
+        seenIn.set(run.runId, id);
+        fresh.push(id);
+        continue;
+      }
+      const updated: StoredRunFailure = {
+        ...group,
+        agentIds: group.agentIds.includes(run.agentId) ? group.agentIds : [...group.agentIds, run.agentId],
+        count: group.count + 1,
+        runIds: [...group.runIds, run.runId],
+      };
+      if (group.groupIds && !group.groupIds.includes(groupId)) {
+        updated.groupIds = [...group.groupIds, groupId];
+        updated.error = overflowError(updated.groupIds.length);
+      }
+      if (run.failedAt < group.firstFailedAt) {
+        // The earliest run owns all first-run fields, whatever the arrival order.
+        updated.firstRunId = run.runId;
+        updated.firstFailedAt = run.failedAt;
+        if (!updated.groupIds) updated.error = errorExcerpt(run.error);
+      }
+      if (run.failedAt >= group.lastFailedAt) {
+        updated.agentId = run.agentId;
+        updated.lastRunId = run.runId;
+        updated.lastFailedAt = run.failedAt;
+        updated.url = this.runUrl(run, config);
+        if (!overflow) updated.errorCode = run.errorCode ?? group.errorCode;
+        // The card follows the latest run, including when that run has none.
+        updated.issueId = run.issueId;
+        updated.issueIdentifier = run.issueId ? issueIdentifier : null;
+      }
+      next[id] = updated;
+      seenIn.set(run.runId, id);
+    }
+    if (JSON.stringify(next) !== JSON.stringify(stored)) await this.ctx.state.set(runFailuresStateKey(companyId), next);
+    for (const id of fresh) this.emitEvent(companyId, next[id]);
   }
 
   /** Collect and commit one company. Call with the company lock held. */
@@ -288,6 +568,10 @@ export class DecisionNotifier {
     };
   }
 
+  private runUrl(run: FailedRun, config: NotifierConfig): string {
+    return `${config.publicBaseUrl}/${config.prefix}/agents/${encodeURIComponent(run.agentId)}/runs/${encodeURIComponent(run.runId)}`;
+  }
+
   private issueUrl(issue: Issue, config: NotifierConfig): string {
     return `${config.publicBaseUrl}/${config.prefix}/issues/${encodeURIComponent(issue.identifier ?? issue.id)}`;
   }
@@ -301,14 +585,26 @@ export class DecisionNotifier {
     // Read the prefix per operation, not once per worker: a company rename changes it.
     const company = await this.ctx.companies.get(companyId);
     const prefix = encodeURIComponent(company?.issuePrefix ?? companyId);
-    return { publicBaseUrl: base, ownerUserIds: owners, prefix };
+    const runFailures =
+      raw.runFailures && typeof raw.runFailures === "object" ? (raw.runFailures as Record<string, unknown>) : {};
+    const minutes = runFailures.windowMinutes;
+    const windowMinutes =
+      typeof minutes === "number" && Number.isInteger(minutes) && minutes >= 1 && minutes <= MAX_RUN_FAILURE_WINDOW_MINUTES
+        ? minutes
+        : DEFAULT_RUN_FAILURE_WINDOW_MINUTES;
+    return {
+      publicBaseUrl: base,
+      ownerUserIds: owners,
+      prefix,
+      runFailures: { enabled: runFailures.enabled !== false, windowMs: windowMinutes * 60_000 },
+    };
   }
 
   private emit(companyId: string, decision: StoredDecision): void {
     this.emitEvent(companyId, toEvent(decision));
   }
 
-  private emitEvent(companyId: string, event: DecisionEvent): void {
+  private emitEvent(companyId: string, event: NotifierEvent): void {
     // emit() has no company argument: the worker routes it to the company the
     // channel was last opened for. Open only on a company change, so a client
     // sees a single `open` event rather than one per decision.
@@ -316,12 +612,17 @@ export class DecisionNotifier {
       this.ctx.streams.open(STREAM_CHANNEL, companyId);
       this.openedCompanyId = companyId;
     }
-    this.ctx.streams.emit(STREAM_CHANNEL, toEvent(event));
+    this.ctx.streams.emit(STREAM_CHANNEL, toPublic(event));
   }
 
   private async load(companyId: string): Promise<PendingMap> {
     const value = await this.ctx.state.get(pendingStateKey(companyId));
     return value && typeof value === "object" ? (value as PendingMap) : {};
+  }
+
+  private async loadRunFailures(companyId: string): Promise<RunFailureMap> {
+    const value = await this.ctx.state.get(runFailuresStateKey(companyId));
+    return value && typeof value === "object" ? (value as RunFailureMap) : {};
   }
 
   private async save(companyId: string, map: PendingMap): Promise<void> {
