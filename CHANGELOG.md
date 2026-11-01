@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed `run_failure` grouping splitting a failure mode in two when an `agent.run.failed` event carried no error text. The blank-excerpt group now adopts the error the reconciliation later recovers for the same run — moving to that error's signature in the same window, or folding into the group (or overflow item) already standing in for it — so later runs with that error join the one group.
+
 ## 0.2.0
 
 - New `run_failure` kind: failed and timed-out agent runs, grouped per normalised error signature and fixed window across agents (`runFailures.windowMinutes`, default 30). Each group is announced once and carries `count`, the agents involved (`agentIds`), first and last run IDs and times, the card identifier, `errorCode` when known, and a redacted error excerpt of at most 200 characters. At most 5 groups per company per window; further distinct failures share one overflow item. Cancelled runs are never announced.
