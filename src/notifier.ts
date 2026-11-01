@@ -428,10 +428,15 @@ export class DecisionNotifier {
             } else {
               const dest = next[destKey];
               const sourceFirst = seen.firstFailedAt < dest.firstFailedAt;
-              const firstAgents = sourceFirst ? seen.agentIds : dest.agentIds;
+              const sourceLast = seen.lastFailedAt >= dest.lastFailedAt;
+              // agentIds are in first-seen order; the group created first
+              // (earlier key, as groups are only ever appended) was seen first.
+              const keys = Object.keys(next);
+              const seenEarlier = keys.indexOf(seenKey) < keys.indexOf(destKey);
+              const firstAgents = seenEarlier ? seen.agentIds : dest.agentIds;
               const merged: StoredRunFailure = {
                 ...dest,
-                agentIds: [...firstAgents, ...(sourceFirst ? dest.agentIds : seen.agentIds).filter((id) => !firstAgents.includes(id))],
+                agentIds: [...firstAgents, ...(seenEarlier ? dest.agentIds : seen.agentIds).filter((id) => !firstAgents.includes(id))],
                 count: dest.count + seen.count,
                 runIds: [...dest.runIds, ...seen.runIds.filter((id) => !dest.runIds.includes(id))],
               };
@@ -440,15 +445,17 @@ export class DecisionNotifier {
                 merged.firstFailedAt = seen.firstFailedAt;
                 if (!dest.groupIds) merged.error = excerpt;
               }
-              if (seen.lastFailedAt >= dest.lastFailedAt) {
+              if (sourceLast) {
                 merged.agentId = seen.agentId;
                 merged.lastRunId = seen.lastRunId;
                 merged.lastFailedAt = seen.lastFailedAt;
                 merged.url = seen.url;
                 merged.issueId = seen.issueId;
                 merged.issueIdentifier = seen.issueIdentifier;
-                if (!dest.groupIds) merged.errorCode = seen.errorCode ?? dest.errorCode;
               }
+              // As in the normal join path, the latest run's code wins, but a
+              // code known from either group is kept over none.
+              if (!dest.groupIds) merged.errorCode = sourceLast ? (seen.errorCode ?? dest.errorCode) : (dest.errorCode ?? seen.errorCode);
               delete next[seenKey];
               next[destKey] = merged;
               for (const runId of seen.runIds) seenIn.set(runId, destKey);

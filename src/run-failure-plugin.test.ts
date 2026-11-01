@@ -484,7 +484,9 @@ describe("run failure reconciliation", () => {
   it("folds an upgraded empty-error group into the group that later runs already formed", async () => {
     const { harness, failures, runs, fail } = await setup();
     await fail("run-1", "2026-11-01T10:01:00.000Z", { error: null });
-    await fail("run-2", "2026-11-01T10:03:00.000Z");
+    // The later run formed its group without an error code; the earlier blank
+    // run's event code is the only one known, so the merge must keep it.
+    await fail("run-2", "2026-11-01T10:03:00.000Z", { errorCode: null });
     expect(failures()).toHaveLength(2);
     const formedId = failures()[1].id;
     runs["i-1"] = [runSummary("run-2", "2026-11-01T10:03:00.000Z"), runSummary("run-1", "2026-11-01T10:01:00.000Z")];
@@ -498,7 +500,31 @@ describe("run failure reconciliation", () => {
       firstRunId: "run-1",
       firstFailedAt: "2026-11-01T10:01:00.000Z",
       lastRunId: "run-2",
+      errorCode: "adapter_failed",
       error: `${MODEL_ERROR} (attempt run-1)`,
+    });
+  });
+
+  it("keeps first-seen agent order when an upgraded group folds into an earlier-timestamped group", async () => {
+    const { harness, runs, fail } = await setup();
+    // agent-2's blank failure is seen first, although agent-1's matching
+    // failure is timestamped earlier and so owns the first/last fields.
+    await fail("run-2", "2026-11-01T10:04:00.000Z", { error: null, agentId: "agent-2" });
+    await fail("run-1", "2026-11-01T10:02:00.000Z", { agentId: "agent-1" });
+    runs["i-1"] = [
+      runSummary("run-2", "2026-11-01T10:04:00.000Z", { agentId: "agent-2" }),
+      runSummary("run-1", "2026-11-01T10:02:00.000Z", { agentId: "agent-1" }),
+    ];
+    await harness.runJob(SCAN_JOB_KEY);
+
+    const pending = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      count: 2,
+      firstRunId: "run-1",
+      lastRunId: "run-2",
+      agentId: "agent-2",
+      agentIds: ["agent-2", "agent-1"],
     });
   });
 
