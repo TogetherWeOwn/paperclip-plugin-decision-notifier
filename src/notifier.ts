@@ -376,18 +376,95 @@ export class DecisionNotifier {
     const seenIn = new Map<string, string>();
     for (const [key, group] of Object.entries(next)) for (const runId of group.runIds) seenIn.set(runId, key);
     const fresh: string[] = [];
+    // A group created in this call is announced at the end of it; when an
+    // upgrade below retires its key, the fresh list must follow or drop it.
+    const dropFresh = (key: string) => {
+      const index = fresh.indexOf(key);
+      if (index !== -1) fresh.splice(index, 1);
+    };
     for (const { run, issueIdentifier } of found) {
       const seenKey = seenIn.get(run.runId);
       if (seenKey) {
         // Seen before (event and scan overlap). Fill in what the first sighting lacked:
         // only the event knows errorCode, and the event's card read may have failed.
-        const seen = next[seenKey];
+        let seen = next[seenKey];
         const patch: Partial<StoredRunFailure> = {};
         if (!seen.groupIds && run.errorCode && !seen.errorCode) patch.errorCode = run.errorCode;
         if (seen.lastRunId === run.runId && seen.issueId === run.issueId && issueIdentifier && !seen.issueIdentifier) {
           patch.issueIdentifier = issueIdentifier;
         }
-        if (Object.keys(patch).length > 0) next[seenKey] = { ...seen, ...patch };
+        if (Object.keys(patch).length > 0) {
+          seen = { ...seen, ...patch };
+          next[seenKey] = seen;
+        }
+        const excerpt = errorExcerpt(run.error);
+        if (!seen.groupIds && excerpt) {
+          if (seen.error === "") {
+            // The first sighting had no error text, so the group sits under the
+            // shared "<no error>" signature with a blank excerpt. Adopt the
+            // recovered error: without text the group's runs were
+            // indistinguishable, so the whole group moves to the recovered
+            // signature in its existing window (or folds into the group, or
+            // overflow item, that already stands in for that signature). Later
+            // runs with this error then join it instead of splitting the
+            // failure mode into a second group. The group was already
+            // announced, so it is not announced again under its new id.
+            const groupId = failureGroupId(errorSignature(run.error));
+            const targetKey = `${groupId}@${seen.createdAt}`;
+            const overflowKey = `${OVERFLOW_GROUP}@${seen.createdAt}`;
+            const destKey = next[targetKey]
+              ? targetKey
+              : next[overflowKey]?.groupIds?.includes(groupId)
+                ? overflowKey
+                : null;
+            if (targetKey === seenKey) {
+              next[seenKey] = { ...seen, error: excerpt };
+            } else if (!destKey) {
+              delete next[seenKey];
+              next[targetKey] = { ...seen, id: targetKey, error: excerpt };
+              for (const runId of seen.runIds) seenIn.set(runId, targetKey);
+              const index = fresh.indexOf(seenKey);
+              if (index !== -1) fresh[index] = targetKey;
+            } else {
+              const dest = next[destKey];
+              const sourceFirst = seen.firstFailedAt < dest.firstFailedAt;
+              const firstAgents = sourceFirst ? seen.agentIds : dest.agentIds;
+              const merged: StoredRunFailure = {
+                ...dest,
+                agentIds: [...firstAgents, ...(sourceFirst ? dest.agentIds : seen.agentIds).filter((id) => !firstAgents.includes(id))],
+                count: dest.count + seen.count,
+                runIds: [...dest.runIds, ...seen.runIds.filter((id) => !dest.runIds.includes(id))],
+              };
+              if (sourceFirst) {
+                merged.firstRunId = seen.firstRunId;
+                merged.firstFailedAt = seen.firstFailedAt;
+                if (!dest.groupIds) merged.error = excerpt;
+              }
+              if (seen.lastFailedAt >= dest.lastFailedAt) {
+                merged.agentId = seen.agentId;
+                merged.lastRunId = seen.lastRunId;
+                merged.lastFailedAt = seen.lastFailedAt;
+                merged.url = seen.url;
+                merged.issueId = seen.issueId;
+                merged.issueIdentifier = seen.issueIdentifier;
+                if (!dest.groupIds) merged.errorCode = seen.errorCode ?? dest.errorCode;
+              }
+              delete next[seenKey];
+              next[destKey] = merged;
+              for (const runId of seen.runIds) seenIn.set(runId, destKey);
+              dropFresh(seenKey);
+            }
+          } else if (
+            seen.firstRunId === run.runId &&
+            seen.error !== excerpt &&
+            failureGroupId(errorSignature(run.error)) === seen.id.split("@")[0]
+          ) {
+            // The excerpt belongs to the first run; if the group adopted a
+            // later run's recovered text first, the first run's own text,
+            // arriving in the same scan, replaces it.
+            next[seenKey] = { ...seen, error: excerpt };
+          }
+        }
         continue;
       }
       const failedMs = Date.parse(run.failedAt);

@@ -453,6 +453,96 @@ describe("run failure reconciliation", () => {
     expect(pending[0].count).toBe(1);
   });
 
+  it("upgrades an empty-error group to the recovered error, so later runs join it instead of splitting", async () => {
+    const { harness, failures, runs, fail } = await setup();
+    await fail("run-1", "2026-11-01T10:02:00.000Z", { error: null });
+    const [blank] = failures();
+    expect(blank.error).toBe("");
+    runs["i-1"] = [runSummary("run-1", "2026-11-01T10:02:00.000Z")];
+    await harness.runJob(SCAN_JOB_KEY);
+    // The group was already announced; the upgrade does not announce it again.
+    expect(failures()).toHaveLength(1);
+
+    const [upgraded] = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(upgraded).toMatchObject({
+      count: 1,
+      firstRunId: "run-1",
+      lastRunId: "run-1",
+      errorCode: "adapter_failed",
+      error: `${MODEL_ERROR} (attempt run-1)`,
+      createdAt: blank.createdAt,
+    });
+    expect(upgraded.id).not.toBe(blank.id);
+
+    // A later run with the recovered error joins the upgraded group.
+    await fail("run-2", "2026-11-01T10:04:00.000Z");
+    const pending = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ id: upgraded.id, count: 2, lastRunId: "run-2" });
+  });
+
+  it("folds an upgraded empty-error group into the group that later runs already formed", async () => {
+    const { harness, failures, runs, fail } = await setup();
+    await fail("run-1", "2026-11-01T10:01:00.000Z", { error: null });
+    await fail("run-2", "2026-11-01T10:03:00.000Z");
+    expect(failures()).toHaveLength(2);
+    const formedId = failures()[1].id;
+    runs["i-1"] = [runSummary("run-2", "2026-11-01T10:03:00.000Z"), runSummary("run-1", "2026-11-01T10:01:00.000Z")];
+    await harness.runJob(SCAN_JOB_KEY);
+
+    const pending = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      id: formedId,
+      count: 2,
+      firstRunId: "run-1",
+      firstFailedAt: "2026-11-01T10:01:00.000Z",
+      lastRunId: "run-2",
+      error: `${MODEL_ERROR} (attempt run-1)`,
+    });
+  });
+
+  it("takes the upgraded excerpt from the first run when the scan returns runs newest first", async () => {
+    const { harness, runs, fail } = await setup();
+    await fail("run-1", "2026-11-01T10:02:00.000Z", { error: null });
+    await fail("run-2", "2026-11-01T10:04:00.000Z", { error: null });
+    runs["i-1"] = [runSummary("run-2", "2026-11-01T10:04:00.000Z"), runSummary("run-1", "2026-11-01T10:02:00.000Z")];
+    await harness.runJob(SCAN_JOB_KEY);
+
+    const pending = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      count: 2,
+      firstRunId: "run-1",
+      lastRunId: "run-2",
+      error: `${MODEL_ERROR} (attempt run-1)`,
+    });
+  });
+
+  it("folds an upgraded empty-error group into the overflow item standing in for its recovered error", async () => {
+    const { harness, runs, fail } = await setup();
+    await fail("run-1", "2026-11-01T10:01:00.000Z", { error: null });
+    for (const [i, error] of ["spawn ENOENT", "EACCES", "quota exceeded", "model not found"].entries()) {
+      await fail(`run-other-${i}`, "2026-11-01T10:02:00.000Z", { error });
+    }
+    // The window is at its cap, so this distinct error goes to the overflow item.
+    await fail("run-disk", "2026-11-01T10:03:00.000Z", { error: "disk full" });
+    runs["i-1"] = [runSummary("run-1", "2026-11-01T10:01:00.000Z", { error: "disk full" })];
+    await harness.runJob(SCAN_JOB_KEY);
+
+    const pending = (await catchUp()).filter((e): e is RunFailureEvent => e.kind === "run_failure");
+    // The blank group is gone; its run now counts under the overflow item.
+    expect(pending.some((f) => f.error === "")).toBe(false);
+    expect(pending).toHaveLength(5);
+    expect(pending.find((f) => f.id.startsWith("overflow@"))).toMatchObject({
+      error: "1 more distinct failure",
+      errorCode: null,
+      count: 2,
+      firstRunId: "run-1",
+      lastRunId: "run-disk",
+    });
+  });
+
   it("skips backlog cards", async () => {
     const { harness, reads } = await setup();
     harness.seed({ issues: [issue("i-1", "TWO-7"), issue("i-back", "TWO-4", { status: "backlog" } as Partial<Issue>)] });
