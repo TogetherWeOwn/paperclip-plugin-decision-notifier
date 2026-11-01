@@ -26,6 +26,11 @@ const plugin = definePlugin({
         await current.onIssueEvent(event.companyId, event.entityId);
       });
     }
+    // Failed and timed-out runs. Cancelled runs have their own event, which is
+    // deliberately not subscribed. The scan job reconciles dropped events.
+    ctx.events.on("agent.run.failed", async (event) => {
+      await current.onRunFailedEvent(event.companyId, event.payload, event.occurredAt, event.entityId);
+    });
   },
 
   async onApiRequest(input: PluginApiRequestInput): Promise<PluginApiResponse> {

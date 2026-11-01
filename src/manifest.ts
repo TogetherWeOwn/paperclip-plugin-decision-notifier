@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "togetherweown.decision-notifier";
-export const PLUGIN_VERSION = "0.1.2";
+export const PLUGIN_VERSION = "0.2.0";
 export const STREAM_CHANNEL = "decisions";
 export const SCAN_JOB_KEY = "decision-scan";
 
@@ -11,7 +11,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "Decision Notifier",
   description:
-    "Pushes pending board decisions (approvals, thread interactions and owner-assigned cards) onto a board-readable plugin stream, so an operator session can wait on it instead of polling. Events carry IDs and URLs only.",
+    "Pushes pending board decisions (approvals, thread interactions and owner-assigned cards) and grouped failed agent runs onto a board-readable plugin stream, so an operator session can wait on it instead of polling. Decision events carry IDs and URLs only; run failures add a short redacted error excerpt.",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
@@ -19,6 +19,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.read",
     "issue.interactions.read",
     "approvals.read",
+    "issues.orchestration.read",
     "events.subscribe",
     "jobs.schedule",
     "plugin.state.read",
@@ -33,7 +34,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: SCAN_JOB_KEY,
       displayName: "Scan for pending decisions",
       description:
-        "Reconciles pending approvals, thread interactions and owner-assigned cards every minute. Thread interactions are not plugin events yet (paperclipai/paperclip#4990), so this scan is how they are found.",
+        "Reconciles pending approvals, thread interactions and owner-assigned cards every minute, and failed agent runs every five minutes. Thread interactions are not plugin events yet (paperclipai/paperclip#4990), so this scan is how they are found.",
       schedule: "* * * * *",
     },
   ],
@@ -62,6 +63,20 @@ const manifest: PaperclipPluginManifestV1 = {
         default: [],
         description:
           "User IDs whose assigned open cards count as decisions. Empty means any card assigned to a human user.",
+      },
+      runFailures: {
+        type: "object",
+        description: "Announce failed and timed-out agent runs, grouped per agent, error signature and time window.",
+        properties: {
+          enabled: { type: "boolean", default: true, description: "Announce failed agent runs. Cancelled runs are never announced." },
+          windowMinutes: {
+            type: "integer",
+            minimum: 1,
+            maximum: 1440,
+            default: 30,
+            description: "Failures of one agent with the same error inside one fixed window of this length become one item.",
+          },
+        },
       },
     },
   },

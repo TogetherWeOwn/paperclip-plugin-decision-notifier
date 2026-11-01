@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Block until the decision stream announces a decision this client has not
-// seen, print it as one JSON line, and exit 0. Exit 1 on any connection or
+// Block until the decision stream announces a decision (or a failed-run group)
+// this client has not seen, print it as one JSON line, and exit 0. Exit 1 on any connection or
 // auth failure, so the caller re-arms (or reports) instead of hanging.
 // If the host answers the stream with HTTP 501 (no plugin stream bus, as in
 // stock Paperclip 2026.1023.0), poll the catch-up route every 30 s instead.
@@ -31,7 +31,9 @@ const REQUEST_TIMEOUT_MS = delayFromEnv("PAPERCLIP_DECISION_WAIT_TIMEOUT_MS", 30
 const POLL_INTERVAL_MS = delayFromEnv("PAPERCLIP_DECISION_WAIT_POLL_MS", 30_000);
 /** Idle time before TCP keepalive probes start, so a dead connection still fails the stream. */
 const KEEPALIVE_MS = 60_000;
-const KINDS = new Set(["approval", "interaction", "owner_card"]);
+const KINDS = new Set(["approval", "interaction", "owner_card", "run_failure"]);
+/** The plugin caps run failure excerpts at 200 characters; enforce it here too. */
+const ERROR_EXCERPT_CHARS = 200;
 
 const { values: args } = parseArgs({
   options: {
@@ -74,12 +76,31 @@ function parseDecision(data) {
   if (!event || typeof event !== "object") return null;
   const { kind, id, issueIdentifier, url, createdAt } = event;
   if (!KINDS.has(kind) || typeof id !== "string" || typeof url !== "string") return null;
-  return {
+  const decision = {
     kind,
     id,
     issueIdentifier: typeof issueIdentifier === "string" ? issueIdentifier : null,
     url,
     createdAt: typeof createdAt === "string" ? createdAt : null,
+  };
+  return kind === "run_failure" ? parseRunFailure(decision, event) : decision;
+}
+
+/** Run failures add grouping fields and a redacted error excerpt (still untrusted text). */
+function parseRunFailure(decision, event) {
+  const { agentId, count, firstRunId, lastRunId, firstFailedAt, lastFailedAt, errorCode, error } = event;
+  const str = (value) => (typeof value === "string" ? value : null);
+  if (typeof agentId !== "string" || typeof lastRunId !== "string" || !Number.isInteger(count) || count < 1) return null;
+  return {
+    ...decision,
+    agentId,
+    count,
+    firstRunId: str(firstRunId) ?? lastRunId,
+    lastRunId,
+    firstFailedAt: str(firstFailedAt),
+    lastFailedAt: str(lastFailedAt),
+    errorCode: str(errorCode),
+    error: (str(error) ?? "").slice(0, ERROR_EXCERPT_CHARS),
   };
 }
 
