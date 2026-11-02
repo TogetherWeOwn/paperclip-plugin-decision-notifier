@@ -129,6 +129,8 @@ const RUN_PAGE_LIMIT = 100;
  * requirement.
  */
 export const COMPANY_LIST_REFRESH_MS = 15 * 60_000;
+/** A failed read of the remembered company set is retried at most this often. */
+const KNOWN_COMPANIES_LOAD_RETRY_MS = 60_000;
 /** Group id of the item that collects a window's distinct failures past the cap. */
 const OVERFLOW_GROUP = "overflow";
 const overflowError = (distinct: number) => `${distinct} more distinct failure${distinct === 1 ? "" : "s"}`;
@@ -223,9 +225,16 @@ export class DecisionNotifier {
   private readonly lastCatchUpScan = new Map<string, { at: number; config: string }>();
   /** When each company's failed runs were last reconciled. */
   private readonly lastRunReconcile = new Map<string, number>();
-  /** Companies this worker has been invoked for, once loaded from state. */
+  /** Companies remembered in state, once a read of it has succeeded. */
   private knownCompanies: Set<string> | null = null;
-  private knownCompaniesLoad: Promise<Set<string>> | null = null;
+  /** Companies noted before the remembered set could be read; merged into it on the first good read. */
+  private readonly sessionCompanies = new Set<string>();
+  private lastKnownCompaniesLoadFailure: number | null = null;
+  /**
+   * Serialises every load/mutate/persist of the company set (notes, list
+   * refreshes), so an older snapshot can never be written back over a newer one.
+   */
+  private knownCompaniesQueue: Promise<unknown> = Promise.resolve();
   /** The last `companies.list` attempt (success or failure) by this worker. */
   private lastCompanyListAttempt: number | null = null;
 
@@ -254,68 +263,100 @@ export class DecisionNotifier {
    */
   async noteCompany(companyId: string | null | undefined): Promise<void> {
     if (!companyId) return;
-    const known = await this.loadKnownCompanies();
-    if (known.has(companyId)) return;
-    known.add(companyId);
-    await this.saveKnownCompanies(known);
+    await this.withKnownCompanies(async (known, loaded) => {
+      if (known.has(companyId)) return;
+      known.add(companyId);
+      // Until the remembered set has been read, `known` holds only this
+      // session's notes; writing it back would erase the stored set.
+      if (loaded) await this.saveKnownCompanies(known);
+    });
   }
 
   /**
    * The companies one scan covers: the remembered set, refreshed from
-   * `companies.list` when it is empty or the last attempt is at least
+   * `companies.list` when the last attempt is at least
    * COMPANY_LIST_REFRESH_MS old. A denied or failing list call (see
    * COMPANY_LIST_REFRESH_MS) falls back to the remembered set — enumerating
    * companies must never fail the job while its per-company calls still work.
    */
-  private async companiesToScan(): Promise<string[]> {
-    const known = await this.loadKnownCompanies();
-    const now = Date.now();
-    const sinceAttempt = this.lastCompanyListAttempt === null ? null : now - this.lastCompanyListAttempt;
-    // A negative age means the clock moved back; wait for it to pass the attempt again.
-    const due = known.size === 0 || sinceAttempt === null || sinceAttempt >= COMPANY_LIST_REFRESH_MS;
-    if (!due) return [...known];
-    this.lastCompanyListAttempt = now;
-    try {
-      const listed = new Set((await this.ctx.companies.list()).map((company) => company.id).filter(Boolean));
+  private companiesToScan(): Promise<string[]> {
+    return this.withKnownCompanies(async (known, loaded) => {
+      const now = Date.now();
+      const sinceAttempt = this.lastCompanyListAttempt === null ? null : now - this.lastCompanyListAttempt;
+      // A negative age means the clock moved back; wait for it to pass the attempt again.
+      if (sinceAttempt !== null && sinceAttempt < COMPANY_LIST_REFRESH_MS) return [...known];
+      this.lastCompanyListAttempt = now;
+      let listed: Set<string>;
+      try {
+        listed = new Set((await this.ctx.companies.list()).map((company) => company.id).filter(Boolean));
+      } catch (err) {
+        this.ctx.logger.warn("company list unavailable; scanning known companies", {
+          error: String(err),
+          knownCompanies: known.size,
+        });
+        return [...known];
+      }
       // An empty list would silently stop every scan; it is only believable
       // when nothing is remembered either.
       if (listed.size === 0 && known.size > 0) return [...known];
-      if (listed.size !== known.size || [...listed].some((id) => !known.has(id))) {
-        this.knownCompanies = listed;
-        await this.saveKnownCompanies(listed);
+      // With a good read of the remembered set, the list replaces it (deleted
+      // companies drop out). Without one, only add: the session's notes must
+      // survive until they can be merged into the stored set.
+      const next = loaded ? listed : new Set([...known, ...listed]);
+      if (next.size !== known.size || [...next].some((id) => !known.has(id))) {
+        known.clear();
+        for (const id of next) known.add(id);
+        if (loaded) await this.saveKnownCompanies(known);
       }
-      return [...listed];
-    } catch (err) {
-      this.ctx.logger.warn("company list unavailable; scanning known companies", {
-        error: String(err),
-        knownCompanies: known.size,
-      });
-      return [...known];
-    }
+      return [...next];
+    });
   }
 
-  private loadKnownCompanies(): Promise<Set<string>> {
-    if (this.knownCompanies) return Promise.resolve(this.knownCompanies);
-    this.knownCompaniesLoad ??= (async () => {
-      let loaded: Set<string>;
-      try {
-        const value = await this.ctx.state.get(knownCompaniesStateKey);
-        loaded = new Set(
-          Array.isArray(value) ? value.filter((id): id is string => typeof id === "string" && id.length > 0) : [],
-        );
-      } catch (err) {
-        this.ctx.logger.warn("known companies unavailable; starting empty", { error: String(err) });
-        loaded = new Set();
-      }
-      // Companies noted while the load was in flight are already in the live set.
-      if (this.knownCompanies) {
-        for (const id of loaded) this.knownCompanies.add(id);
-      } else {
-        this.knownCompanies = loaded;
-      }
-      return this.knownCompanies;
-    })();
-    return this.knownCompaniesLoad;
+  /**
+   * Run `fn` with the live company set, one operation at a time, after a
+   * (re)try of the state read if it has not succeeded yet. `loaded` says
+   * whether the set is the remembered one (`true`, safe to persist) or only
+   * this session's notes. Never call `noteCompany`/`companiesToScan` from
+   * `fn`: the queue would deadlock.
+   */
+  private withKnownCompanies<T>(fn: (known: Set<string>, loaded: boolean) => Promise<T>): Promise<T> {
+    const run = this.knownCompaniesQueue.then(async () => {
+      const known = await this.loadKnownCompanies();
+      return fn(known, known === this.knownCompanies);
+    });
+    this.knownCompaniesQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * The remembered set once read, else the session's notes. A failed read is
+   * not cached as "empty": it is retried on a later operation, and the
+   * session's notes merge into the remembered set when a read succeeds.
+   * Call only from inside `withKnownCompanies`.
+   */
+  private async loadKnownCompanies(): Promise<Set<string>> {
+    if (this.knownCompanies) return this.knownCompanies;
+    const now = Date.now();
+    const sinceFailure = this.lastKnownCompaniesLoadFailure === null ? null : now - this.lastKnownCompaniesLoadFailure;
+    if (sinceFailure !== null && sinceFailure >= 0 && sinceFailure < KNOWN_COMPANIES_LOAD_RETRY_MS) {
+      return this.sessionCompanies;
+    }
+    let value: unknown;
+    try {
+      value = await this.ctx.state.get(knownCompaniesStateKey);
+    } catch (err) {
+      this.lastKnownCompaniesLoadFailure = now;
+      this.ctx.logger.warn("known companies unavailable; using this session's notes", { error: String(err) });
+      return this.sessionCompanies;
+    }
+    const loaded = new Set(
+      Array.isArray(value) ? value.filter((id): id is string => typeof id === "string" && id.length > 0) : [],
+    );
+    const hadUnmergedNotes = [...this.sessionCompanies].some((id) => !loaded.has(id));
+    for (const id of this.sessionCompanies) loaded.add(id);
+    this.knownCompanies = loaded;
+    if (hadUnmergedNotes) await this.saveKnownCompanies(loaded);
+    return loaded;
   }
 
   private async saveKnownCompanies(known: Set<string>): Promise<void> {

@@ -445,4 +445,73 @@ describe("scanAll company enumeration", () => {
 
     expect(emitted.map((e) => e.id)).toEqual(["ap-1"]);
   });
+
+  it("retries a denied company list at most once per refresh window, even knowing no company", async () => {
+    const { harness, notifier } = setup();
+    let calls = 0;
+    harness.ctx.companies.list = async () => {
+      calls++;
+      throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+    };
+
+    await notifier.scanAll();
+    await notifier.scanAll();
+
+    expect(calls).toBe(1);
+  });
+
+  it("persists concurrent company notes without an older snapshot overwriting a newer one", async () => {
+    const { harness, notifier } = setup();
+    const set = harness.ctx.state.set.bind(harness.ctx.state);
+    let first = true;
+    harness.ctx.state.set = async (key, value) => {
+      // The first known-companies write lands last; unserialised, its stale
+      // snapshot would replace the second note's fuller one.
+      if (key.stateKey === "known-companies" && first) {
+        first = false;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      return set(key, value);
+    };
+
+    await Promise.all([notifier.noteCompany("c-a"), notifier.noteCompany("c-b")]);
+
+    const persisted = await harness.ctx.state.get({ scopeKind: "instance", stateKey: "known-companies" });
+    expect([...(persisted as string[])].sort()).toEqual(["c-a", "c-b"]);
+  });
+
+  it("retries a failed read of the remembered companies instead of caching empty", async () => {
+    const { harness, emitted, notifier } = setup();
+    await harness.ctx.state.set({ scopeKind: "instance", stateKey: "known-companies" }, [COMPANY]);
+    const get = harness.ctx.state.get.bind(harness.ctx.state);
+    let failRead = true;
+    harness.ctx.state.get = async (key) => {
+      if (key.stateKey === "known-companies" && failRead) {
+        failRead = false;
+        throw new Error("state down");
+      }
+      return get(key);
+    };
+    denyList(harness);
+    harness.seed({
+      companies: [company(), company("c-2", "OTH")],
+      approvals: [approval("ap-1"), approval("ap-2", { companyId: "c-2" } as Partial<Approval>)],
+    });
+
+    // Noted while the remembered set is unreadable: kept for the session, and
+    // the stored set is not overwritten by the partial one.
+    await notifier.noteCompany("c-2");
+    await notifier.scanAll();
+    expect(emitted.map((e) => e.id)).toEqual(["ap-2"]);
+
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      await notifier.scanAll();
+    } finally {
+      now.mockRestore();
+    }
+    expect(emitted.map((e) => e.id)).toEqual(["ap-2", "ap-1"]);
+    const persisted = await harness.ctx.state.get({ scopeKind: "instance", stateKey: "known-companies" });
+    expect([...(persisted as string[])].sort()).toEqual([COMPANY, "c-2"].sort());
+  });
 });
