@@ -244,6 +244,8 @@ export class DecisionNotifier {
   private readonly lastCatchUpScan = new Map<string, { at: number; config: string }>();
   /** When each company's failed runs were last reconciled. */
   private readonly lastRunReconcile = new Map<string, number>();
+  /** Companies with a reconciliation in flight; the throttle above is stamped only after a pass. */
+  private readonly reconciling = new Set<string>();
   /** When each company's last event-triggered scan started; claimed up front, so it also guards reentry. */
   private readonly lastEventScanAt = new Map<string, number>();
   /** Companies whose job-context scope denial was already logged this session. */
@@ -521,9 +523,22 @@ export class DecisionNotifier {
    * complete read, and run ids dedupe the overlap with events.
    */
   async reconcileRunFailures(companyId: string): Promise<void> {
+    // Events can arrive in bursts while a pass is still reading; the throttle
+    // below only takes effect once a pass finishes, so claim the company
+    // first (synchronously) and let overlapping callers skip.
+    if (this.reconciling.has(companyId)) return;
     const now = Date.now();
     const last = this.lastRunReconcile.get(companyId);
     if (last !== undefined && now - last >= 0 && now - last < RUN_RECONCILE_INTERVAL_MS) return;
+    this.reconciling.add(companyId);
+    try {
+      await this.reconcileRunFailuresPass(companyId, now);
+    } finally {
+      this.reconciling.delete(companyId);
+    }
+  }
+
+  private async reconcileRunFailuresPass(companyId: string, now: number): Promise<void> {
     const config = await this.config(companyId);
     if (!config.runFailures.enabled) return;
     const storedCursor = await this.ctx.state.get(runCursorStateKey(companyId));

@@ -433,6 +433,28 @@ describe("event-triggered scans", () => {
     expect(harness.logs.filter((log) => log.message === "decision scan completed")).toHaveLength(1);
   });
 
+  it("does not start a second reconciliation while one is in flight", async () => {
+    const { harness, notifier } = setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    let cursorReads = 0;
+    const get = harness.ctx.state.get.bind(harness.ctx.state);
+    harness.ctx.state.get = async (key) => {
+      if (key.stateKey === "run-failure-cursor") {
+        cursorReads++;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      return get(key);
+    };
+
+    // The throttle is stamped only after a successful pass, so without an
+    // in-flight guard every event in a burst would start its own pass.
+    const first = notifier.reconcileRunFailures(COMPANY);
+    const second = notifier.reconcileRunFailures(COMPANY);
+    await Promise.all([first, second]);
+
+    expect(cursorReads).toBe(1);
+  });
+
   it("ignores a missing company id", async () => {
     const { harness, notifier } = setup();
     await notifier.scanFromEventIfDue(null);
