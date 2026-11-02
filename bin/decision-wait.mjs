@@ -35,7 +35,7 @@ const KINDS = new Set(["approval", "interaction", "owner_card", "run_failure"]);
 /** The plugin caps run failure excerpts at 200 characters; enforce it here too. */
 const ERROR_EXCERPT_CHARS = 200;
 /** Advisory routing audiences on decision events. */
-const AUDIENCES = new Set(["owner", "board", "anyone"]);
+const AUDIENCES = new Set(["owner", "operator", "board", "anyone"]);
 
 const { values: args } = parseArgs({
   options: {

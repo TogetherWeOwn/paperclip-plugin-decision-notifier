@@ -23,9 +23,9 @@ export type DecisionKind = "approval" | "interaction" | "owner_card";
 export type EventKind = DecisionKind | "run_failure";
 
 /** Who should act on a decision event. A routing hint for wake-up/skip decisions, never authorization. */
-export type DecisionAudience = "owner" | "board" | "anyone";
+export type DecisionAudience = "owner" | "operator" | "board" | "anyone";
 
-const AUDIENCES: readonly DecisionAudience[] = ["owner", "board", "anyone"];
+const AUDIENCES: readonly DecisionAudience[] = ["owner", "operator", "board", "anyone"];
 
 /**
  * The only shape that ever leaves the plugin. IDs, URLs and host-derived
@@ -868,9 +868,13 @@ export class DecisionNotifier {
   }
 
   /**
-   * Replace the stored set with `build(stored)` and emit the decisions it adds.
-   * Fields are refreshed from the latest read (URL config may have changed);
-   * only the first-seen createdAt is kept. Call with the company lock held.
+   * Replace the stored set with `build(stored)` and emit the decisions it adds,
+   * plus any whose audience is reclassified (addressee or `ownerUserIds`
+   * changed, or the derivation changed across an upgrade). Fields are refreshed
+   * from the latest read (URL config may have changed); only the first-seen
+   * createdAt is kept, so a re-announced decision keeps its dedupe key and only
+   * wakes consumers that skipped the old audience without marking it seen.
+   * Call with the company lock held.
    */
   private async commit(
     companyId: string,
@@ -883,7 +887,11 @@ export class DecisionNotifier {
     for (const [key, decision] of Object.entries(build(stored))) {
       const previous = stored[key];
       next[key] = previous ? { ...decision, createdAt: previous.createdAt } : decision;
-      if (!previous) fresh.push(decision);
+      // Compare normalized on both sides: a stored entry from before routing
+      // fields existed reads as "board" on the way out, and an event path may
+      // hand it back retained verbatim (audience absent). Either side left raw
+      // would re-announce unchanged legacy entries on every such commit.
+      if (!previous || toEvent(previous).audience !== toEvent(decision).audience) fresh.push(next[key]);
     }
     if (!samePending(next, stored)) await this.save(companyId, next);
     if (emitNew) for (const decision of fresh) this.emit(companyId, decision);
@@ -936,10 +944,18 @@ export class DecisionNotifier {
   /**
    * Routing hint for an interaction: a user addressee needs that user, a
    * `human_only` interaction needs a human on the board, and anything else
-   * any agent consumer may resolve.
+   * any agent consumer may resolve. An addressed user is `owner` only when
+   * they are a configured owner; when `ownerUserIds` is empty any addressed
+   * user keeps today's `owner` label, and any other addressed user (for
+   * example the operator user that board/host steps are addressed to) is
+   * `operator`, so an operator step is not misrouted to the owner.
    */
-  private interactionAudience(interaction: Interaction): DecisionAudience {
-    if (interaction.addresseeUserId) return "owner";
+  private interactionAudience(interaction: Interaction, config: NotifierConfig): DecisionAudience {
+    if (interaction.addresseeUserId) {
+      return config.ownerUserIds.length === 0 || config.ownerUserIds.includes(interaction.addresseeUserId)
+        ? "owner"
+        : "operator";
+    }
     if (interaction.effectiveResolverPolicy === "human_only") return "board";
     return "anyone";
   }
@@ -956,7 +972,7 @@ export class DecisionNotifier {
         issueIdentifier: issue.identifier,
         url: this.issueUrl(issue, config),
         createdAt: isoString(interaction.createdAt),
-        audience: this.interactionAudience(interaction),
+        audience: this.interactionAudience(interaction, config),
         interactionKind: interaction.kind,
         originKind: issue.originKind ?? null,
         originId: issue.originId ?? null,

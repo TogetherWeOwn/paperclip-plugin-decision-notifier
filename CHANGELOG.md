@@ -4,6 +4,10 @@
 
 (nothing yet)
 
+## 0.3.5
+
+- Fixed every user-addressed interaction being tagged `audience: "owner"`. Board/host steps addressed to the operator user were indistinguishable from owner decisions, so a consumer filtered by `--audience` routed them wrong and the owner/operator split was lost. An addressed interaction is now `owner` only when its `addresseeUserId` is in the configured `ownerUserIds` (or that list is empty, keeping the previous behaviour), and `operator` for any other addressed user. Unaddressed interactions are unchanged (`board` for `human_only`, else `anyone`), as are approvals (`board`) and owner cards (`owner`) — owner cards are already gated on `ownerUserIds`. A decision whose audience is reclassified while still pending (as stored operator steps are on this upgrade) is announced again on the next scan with its first-seen `createdAt`, keeping its dedupe key: consumers that already announced it stay quiet, and a waiter filtered to the new audience wakes. `paperclip-decision-wait` accepts `operator` in `--audience` and prints it. To use the split, set the owner's user ID in `ownerUserIds`: with the list empty, every addressed user is still `owner`.
+
 ## 0.3.4
 
 - Fixed the last recurring denied call left after 0.3.3: the 15-minute `companies.list` discovery refresh, which the host still denied — and logged as a "host handler error" — at every retry whenever any event invocation was active, even once per-company job scans were running fine. 0.3.3 deliberately kept the retry because a wildcard denial can lift in a fully idle window, but in a busy instance that window never comes: measured in production, every refresh was denied while the job scanned successfully each minute. A scope-denied refresh is now latched off for the worker session after one warning (a restart re-probes once); non-scope list failures keep the 15-minute retry. New companies are still learned without the list, from every company-scoped entry point including `company.created`.

@@ -127,7 +127,7 @@ describe("public event shapes", () => {
     });
   });
 
-  it("toEvent resets a stored audience outside the three known strings", () => {
+  it("toEvent resets a stored audience outside the four known strings", () => {
     const stored = {
       kind: "interaction",
       id: "ix-1",

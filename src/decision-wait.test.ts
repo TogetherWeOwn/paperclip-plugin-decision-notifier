@@ -579,10 +579,26 @@ describe("decision-wait routing filters", () => {
     });
   });
 
+  it("filters on the operator audience", async () => {
+    const operatorDecision = (id: string) =>
+      decision("interaction", id, { audience: "operator", interactionKind: "request_confirmation" });
+    const fake = await fakePaperclip({
+      pending: [ownerDecision("ix-owner")],
+      later: [`data: ${JSON.stringify(operatorDecision("ix-operator"))}\n\n`],
+    });
+    const seen = tmpFile();
+    const result = await run(fake.url, seen, TOKEN, {}, 5000, ["--audience", "operator"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ id: "ix-operator", audience: "operator" });
+    expect(readFileSync(seen, "utf8").split("\n").filter(Boolean)).toEqual([
+      "interaction:ix-operator:2026-10-31T12:00:00.000Z",
+    ]);
+  });
+
   it.each(["everyone", "owner,bogus", ""])("exits 1 on an invalid --audience value (%s)", async (value) => {
     const fake = await fakePaperclip({ pending: [] });
     const result = await run(fake.url, tmpFile(), TOKEN, {}, 5000, ["--audience", value]);
     expect(result.code).toBe(1);
-    expect(result.stderr).toBe("decision-wait: --audience must be a comma-separated list of owner, board, anyone\n");
+    expect(result.stderr).toBe("decision-wait: --audience must be a comma-separated list of owner, operator, board, anyone\n");
   });
 });

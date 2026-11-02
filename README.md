@@ -36,7 +36,7 @@ There is no title, summary, payload or comment text. That text is written by age
 
 The four routing fields are host-derived hints for wake-up/skip decisions, never authorization:
 
-- `audience` is one of `owner`, `board` or `anyone`. An interaction addressed to a user is `owner`; otherwise an interaction whose effective resolver policy is `human_only` is `board`; anything else is `anyone`. Approvals are `board`; owner-assigned cards are `owner`.
+- `audience` is one of `owner`, `operator`, `board` or `anyone`. An interaction addressed to a configured owner user (`ownerUserIds`) is `owner`; an interaction addressed to any other user (for example the operator user that board/host steps are addressed to) is `operator`; when `ownerUserIds` is empty any addressed user is `owner`, as before. Otherwise an interaction whose effective resolver policy is `human_only` is `board`; anything else is `anyone`. Approvals are `board`; owner-assigned cards are `owner`.
 - `interactionKind` is the interaction's kind (`request_confirmation`, `ask_user_questions`, …) for interactions, `null` otherwise.
 - `originKind` / `originId` are the issue's origin, passed through verbatim and never parsed by this plugin; they are `null` for approvals, which belong to no issue. Events on cards the board council created carry `originKind: "plugin:board-council"`.
 
@@ -45,6 +45,7 @@ Consumer rules (binding on the operator session and any stream consumer):
 - `audience` is advisory routing only. A consumer re-reads the interaction (addressee, effective policy, status) before acting; events from older plugin versions have no audience and must still be announced, never silently dropped.
 - `originKind: "plugin:board-council"` means hands off: never resolve, skip or cancel such an event. The announcement exists so a human-facing session can see that an owner window is open.
 - `audience: "owner"` means only that user resolves it. Agent consumers take no action except, where their instructions allow, reminding the owner out-of-band.
+- `audience: "operator"` means only the addressed non-owner user resolves it (for example board/host steps addressed to the operator). The same hands-off rule applies: agent consumers never resolve it; at most remind the operator where their instructions allow.
 - Once the council is live, `audience: "anyone"` interactions in board-decision categories are instruction-compliance failures (the requesting agent skipped the council route). The operator does not resolve them; it comments with the correct route and the creator withdraws and reopens as a matter. These events are countable from the catch-up list (`audience: "anyone"`, `originKind` not `plugin:board-council`, by `interactionKind` and `createdAt`); the plugin keeps no counters of its own.
 
 A `run_failure` adds grouping fields and a short error excerpt, because a failed run is useless to the operator without at least a hint of why:
@@ -59,7 +60,7 @@ A `run_failure` adds grouping fields and a short error excerpt, because a failed
 - `error` is the first run's error with control characters flattened, credentials redacted (bearer tokens of any length and basic tokens, `key=value` and JSON pairs whose key names a token, secret, password, cookie or session, `NAME_KEY=`, `NAME_TOKEN=` and `NAME_SECRET=` values, `pwd=` and `pass=`, space-separated flags such as `--api-key X` and `--token X`, with a quoted value redacted through its closing quote, credentials in URLs, common API key and token formats including `sk-` and `sk_` keys, JWTs, email addresses and long opaque strings), then cut to 200 characters. Redaction runs before truncation. It is still untrusted text: open the run before acting.
 - `url` points at the latest failed run. `issueIdentifier` is that run's card, or `null` when the run had none or the plugin cannot read the card. `errorCode` comes only from the event; a group found only by reconciliation has `null` until an event fills it in.
 
-Each decision is announced once. The set of pending decisions is kept per company in `plugin.state`, so a worker restart does not re-announce. A decision that is resolved and later becomes pending again is announced again. Run failure groups are kept the same way, with the run IDs they counted, so an event and the reconciliation never count one run twice; a group leaves the set 24 hours after its last failure.
+Each decision is announced once. The set of pending decisions is kept per company in `plugin.state`, so a worker restart does not re-announce. A decision that is resolved and later becomes pending again is announced again, and so is one whose audience is reclassified (its addressee or `ownerUserIds` changed, or the derivation changed across an upgrade) — with the same dedupe key, so only consumers that skipped the old audience without marking it seen wake. Run failure groups are kept the same way, with the run IDs they counted, so an event and the reconciliation never count one run twice; a group leaves the set 24 hours after its last failure.
 
 ## Consuming the stream
 
@@ -82,7 +83,7 @@ PAPERCLIP_BOARD_TOKEN_FILE=$HOME/.paperclip/board-token \
 paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-decisions-seen
 ```
 
-- `--company` is required. `--api` overrides `PAPERCLIP_API_URL`; a trailing `/api` is stripped from either. `--plugin` overrides the plugin ID (default `togetherweown.decision-notifier`). `--audience <csv>` wakes only for decisions with one of the listed audiences (`owner`, `board`, `anyone`); anything else is silently skipped and never marked seen. `--exclude-origin-kind <csv>` skips events whose `originKind` is listed (for example `plugin:board-council`), also without marking them seen. With neither flag the waiter behaves exactly as before. Events with no audience (older plugins) always pass `--audience`, and `run_failure` items ignore it entirely.
+- `--company` is required. `--api` overrides `PAPERCLIP_API_URL`; a trailing `/api` is stripped from either. `--plugin` overrides the plugin ID (default `togetherweown.decision-notifier`). `--audience <csv>` wakes only for decisions with one of the listed audiences (`owner`, `operator`, `board`, `anyone`); anything else is silently skipped and never marked seen. `--exclude-origin-kind <csv>` skips events whose `originKind` is listed (for example `plugin:board-council`), also without marking them seen. With neither flag the waiter behaves exactly as before. Events with no audience (older plugins) always pass `--audience`, and `run_failure` items ignore it entirely.
 - The token is read from a file, never from argv.
 - `--seen` lists announced decisions as `kind:id:createdAt`. Replayed decisions already in it do not wake the caller; entries that are no longer pending are pruned on connect. A card that is unassigned and reassigned gets a new `createdAt`, so it announces again. Use one waiter per `--seen` file; the file is not locked across processes.
 - A decision is marked seen only after stdout has accepted it.
@@ -97,7 +98,7 @@ paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-deci
 | key | default | meaning |
 |---|---|---|
 | `publicBaseUrl` | `""` | Web app base URL for event links. Links are relative paths when empty. |
-| `ownerUserIds` | `[]` | User IDs whose assigned open cards count as decisions. Empty means any card assigned to a user. |
+| `ownerUserIds` | `[]` | User IDs whose assigned open cards count as decisions, and the only addressees tagged with the `owner` audience (any other addressed user is `operator`). Empty means any card assigned to a user, and any addressed user is tagged `owner`. Set the owner to keep operator-addressed steps (`operator`) apart from owner decisions. |
 | `runFailures.enabled` | `true` | Announce failed and timed-out agent runs. When `false`, run failures are neither collected nor replayed. |
 | `runFailures.windowMinutes` | `30` | Length of the fixed grouping window, 1 to 1440. Invalid values fall back to 30. |
 
