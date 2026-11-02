@@ -248,8 +248,14 @@ export class DecisionNotifier {
   private readonly reconciling = new Map<string, Promise<void>>();
   /** When each company's last event-triggered scan started; claimed up front, so it also guards reentry. */
   private readonly lastEventScanAt = new Map<string, number>();
-  /** Companies whose job-context scope denial was already logged this session. */
-  private readonly jobScopeDenialLogged = new Set<string>();
+  /**
+   * Companies the host has scope-denied to the job this session. The scopes a
+   * scopeless job may act under are fixed when the worker loads (see
+   * EVENT_SCAN_INTERVAL_MS), so a denial cannot clear until a restart: the
+   * job skips these companies instead of repeating a call the host logs an
+   * error for every minute. A restart re-probes.
+   */
+  private readonly jobScopeDenied = new Set<string>();
   /** Companies remembered in state, once a read of it has succeeded. */
   private knownCompanies: Set<string> | null = null;
   /** Companies noted before the remembered set could be read; merged into it on the first good read. */
@@ -305,13 +311,18 @@ export class DecisionNotifier {
 
   /** Scan one company and reconcile its failed runs, logging either part's failure without throwing. */
   private async scanAndReconcile(companyId: string, source: "job" | "event", reconcile = true): Promise<void> {
+    // Denied to the job once this session: make no host call at all (see jobScopeDenied).
+    if (source === "job" && this.jobScopeDenied.has(companyId)) return;
     try {
       const pending = await this.scanCompany(companyId);
       this.ctx.logger.info("decision scan completed", { companyId, source, pending: pending.length });
     } catch (err) {
       this.logScanFailure("decision scan failed", companyId, source, err);
     }
-    if (reconcile) await this.tryReconcile(companyId, source);
+    // The scan above may just have latched the denial; do not spend a second denied call on reconciliation.
+    if (reconcile && !(source === "job" && this.jobScopeDenied.has(companyId))) {
+      await this.tryReconcile(companyId, source);
+    }
   }
 
   /** Reconcile one company's failed runs (self-throttled), logging a failure without throwing. */
@@ -325,14 +336,14 @@ export class DecisionNotifier {
 
   /**
    * A scope denial from the job context is the host working as configured
-   * (see EVENT_SCAN_INTERVAL_MS), not a scan error: warn once per company
-   * per session instead of logging an error every minute for a scan the
-   * event path is already covering.
+   * (see EVENT_SCAN_INTERVAL_MS), not a scan error: latch it for the session
+   * (see jobScopeDenied) and warn once per company instead of logging an
+   * error every minute for a scan the event path is already covering.
    */
   private logScanFailure(message: string, companyId: string, source: "job" | "event", err: unknown): void {
     if (source === "job" && isInvocationScopeDenial(err)) {
-      if (this.jobScopeDenialLogged.has(companyId)) return;
-      this.jobScopeDenialLogged.add(companyId);
+      if (this.jobScopeDenied.has(companyId)) return;
+      this.jobScopeDenied.add(companyId);
       this.ctx.logger.warn("scan unavailable from job context; relying on event-driven scans", {
         companyId,
         error: String(err),
@@ -364,9 +375,15 @@ export class DecisionNotifier {
    * COMPANY_LIST_REFRESH_MS old. A denied or failing list call (see
    * COMPANY_LIST_REFRESH_MS) falls back to the remembered set — enumerating
    * companies must never fail the job while its per-company calls still work.
+   * The refresh is skipped while the host has denied the job every known
+   * company (see jobScopeDenied): discovering more companies cannot give the
+   * job anything it may scan, and a denied refresh only repeats the host's
+   * error log. It resumes when an event notes a company the job has not been
+   * denied — and new companies are learned from events either way.
    */
   private companiesToScan(): Promise<string[]> {
     return this.withKnownCompanies(async (known, loaded) => {
+      if (known.size > 0 && [...known].every((id) => this.jobScopeDenied.has(id))) return [...known];
       const now = Date.now();
       const sinceAttempt = this.lastCompanyListAttempt === null ? null : now - this.lastCompanyListAttempt;
       // A negative age means the clock moved back; wait for it to pass the attempt again.

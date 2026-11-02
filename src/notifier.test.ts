@@ -495,12 +495,15 @@ describe("event-triggered scans", () => {
 describe("job-context scope denials", () => {
   it("warns once per company instead of erroring every run when the host denies the job's calls", async () => {
     const { harness, notifier } = setup();
+    let configCalls = 0;
     harness.ctx.config.get = async () => {
+      configCalls++;
       throw new Error(
         'Plugin "p" is not allowed to perform "config.get": the worker referenced a missing, expired, or unknown invocation scope',
       );
     };
 
+    await notifier.scanAll();
     await notifier.scanAll();
     await notifier.scanAll();
 
@@ -511,6 +514,36 @@ describe("job-context scope denials", () => {
     expect(warnings[0].level).toBe("warn");
     expect(warnings[0].meta?.companyId).toBe(COMPANY);
     expect(harness.logs.filter((log) => log.level === "error")).toEqual([]);
+    // The host logs an error for every denied call, so after the first denial
+    // the job must stop calling entirely — including the reconciliation that
+    // would otherwise spend a second denied call in the same pass.
+    expect(configCalls).toBe(1);
+  });
+
+  it("keeps scanning from events after the job is latched off, and a restart re-probes the job", async () => {
+    const { harness, notifier } = setup();
+    const getConfig = harness.ctx.config.get.bind(harness.ctx.config);
+    let denied = true;
+    harness.ctx.config.get = async (...args) => {
+      if (denied) throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+      return getConfig(...args);
+    };
+
+    await notifier.scanAll(); // denied: latches the job off for this session
+    denied = false;
+    await notifier.scanAll(); // still latched: the job makes no call the host could log
+    await notifier.scanFromEventIfDue(COMPANY); // events carry a company scope and are unaffected
+
+    expect(harness.logs.filter((log) => log.message === "decision scan completed")).toEqual([
+      { level: "info", message: "decision scan completed", meta: { companyId: COMPANY, source: "event", pending: 0 } },
+    ]);
+
+    // A new notifier on the same store (worker restart) probes the job again.
+    const restarted = new DecisionNotifier(harness.ctx);
+    await restarted.scanAll();
+    expect(
+      harness.logs.filter((log) => log.message === "decision scan completed" && log.meta?.source === "job"),
+    ).toHaveLength(1);
   });
 });
 
@@ -602,6 +635,75 @@ describe("scanAll company enumeration", () => {
     await notifier.scanAll();
 
     expect(calls).toBe(1);
+  });
+
+  it("stops refreshing the company list once the job is denied every known company", async () => {
+    const { harness, notifier } = setup();
+    let listCalls = 0;
+    harness.ctx.companies.list = async () => {
+      listCalls++;
+      throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+    };
+    let configCalls = 0;
+    harness.ctx.config.get = async () => {
+      configCalls++;
+      throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+    };
+
+    await notifier.noteCompany(COMPANY);
+    await notifier.scanAll(); // list denied, then the company's scan denied: latched
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + COMPANY_LIST_REFRESH_MS + 1);
+    try {
+      await notifier.scanAll();
+    } finally {
+      now.mockRestore();
+    }
+
+    // Discovering more companies cannot give the job anything it may scan, so
+    // it makes no further call the host would log an error for.
+    expect(listCalls).toBe(1);
+    expect(configCalls).toBe(1);
+  });
+
+  it("keeps retrying a scope-denied company list while the job can still scan a known company", async () => {
+    const { harness, notifier } = setup();
+    let calls = 0;
+    harness.ctx.companies.list = async () => {
+      calls++;
+      throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+    };
+
+    await notifier.noteCompany(COMPANY); // per-company calls are admitted in this harness
+    await notifier.scanAll();
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + COMPANY_LIST_REFRESH_MS + 1);
+    try {
+      await notifier.scanAll();
+    } finally {
+      now.mockRestore();
+    }
+
+    // A wildcard denial is transient (it lifts when no scoped invocation is
+    // active), so a job that can scan keeps its discovery refresh.
+    expect(calls).toBe(2);
+  });
+
+  it("still retries a company list that failed for a non-scope reason after the refresh window", async () => {
+    const { harness, notifier } = setup();
+    let calls = 0;
+    harness.ctx.companies.list = async () => {
+      calls++;
+      throw new Error("host temporarily unavailable");
+    };
+
+    await notifier.scanAll();
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + COMPANY_LIST_REFRESH_MS + 1);
+    try {
+      await notifier.scanAll();
+    } finally {
+      now.mockRestore();
+    }
+
+    expect(calls).toBe(2);
   });
 
   it("persists concurrent company notes without an older snapshot overwriting a newer one", async () => {

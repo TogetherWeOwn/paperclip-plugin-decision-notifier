@@ -4,6 +4,10 @@
 
 (nothing yet)
 
+## 0.3.3
+
+- Fixed the `decision-scan` job still making the host log a "host handler error" every minute after 0.3.2 on hosts that deny its calls. 0.3.2 made the event-driven scan do the periodic work and quieted the plugin's own logging to one warning per company, but the job kept *attempting* the denied per-company calls (and the wildcard `companies.list` refresh), and the host logs an error for each denied call the plugin makes. The scopes a scopeless job may act under are fixed when the worker loads, so a per-company scope denial cannot clear mid-session: the job now latches a company's denial for the session and makes no further calls for it, while event-driven scans are unaffected and a worker restart re-probes. The company-list refresh keeps its retry cadence while the job can scan at least one known company (a wildcard denial is transient), and is skipped only once every known company is latched — discovering more companies cannot give the job anything it may scan, and new companies are learned from events either way.
+
 ## 0.3.2
 
 - Fixed the periodic scan still not running after 0.3.1 on hosts that gate worker calls by invocation scope. 0.3.1 removed the scan's dependence on the wildcard `companies.list`, but a scopeless job's per-company calls are admitted only for companies the host has authorized for proactive work — a set the host seeds from per-company plugin config. This plugin's config is instance-scoped, so that set can be empty, and then every per-company call from the job is denied ("missing, expired, or unknown invocation scope") while any event invocation is active; the job merely *looked* successful because per-company failures are caught. The scan now also runs from inside company-scoped event invocations, throttled to once a minute per company, where all of its calls are admitted. The job remains as a fallback for hosts that authorize it, logs one warning per company when the host denies it instead of an error every minute, and every completed scan logs `decision scan completed` with its source (`job` or `event`) and pending count. Event, catch-up and stream behavior is otherwise unchanged.
