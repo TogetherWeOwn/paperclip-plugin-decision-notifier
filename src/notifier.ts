@@ -256,8 +256,6 @@ export class DecisionNotifier {
    * error for every minute. A restart re-probes.
    */
   private readonly jobScopeDenied = new Set<string>();
-  /** Whether the host has scope-denied `companies.list` to the job this session; latched like the set above. */
-  private jobCompanyListDenied = false;
   /** Companies remembered in state, once a read of it has succeeded. */
   private knownCompanies: Set<string> | null = null;
   /** Companies noted before the remembered set could be read; merged into it on the first good read. */
@@ -377,12 +375,15 @@ export class DecisionNotifier {
    * COMPANY_LIST_REFRESH_MS old. A denied or failing list call (see
    * COMPANY_LIST_REFRESH_MS) falls back to the remembered set — enumerating
    * companies must never fail the job while its per-company calls still work.
-   * A scope-denied list is not retried this session: companies are still
-   * learned from events, and a worker restart re-probes.
+   * The refresh is skipped while the host has denied the job every known
+   * company (see jobScopeDenied): discovering more companies cannot give the
+   * job anything it may scan, and a denied refresh only repeats the host's
+   * error log. It resumes when an event notes a company the job has not been
+   * denied — and new companies are learned from events either way.
    */
   private companiesToScan(): Promise<string[]> {
     return this.withKnownCompanies(async (known, loaded) => {
-      if (this.jobCompanyListDenied) return [...known];
+      if (known.size > 0 && [...known].every((id) => this.jobScopeDenied.has(id))) return [...known];
       const now = Date.now();
       const sinceAttempt = this.lastCompanyListAttempt === null ? null : now - this.lastCompanyListAttempt;
       // A negative age means the clock moved back; wait for it to pass the attempt again.
@@ -392,7 +393,6 @@ export class DecisionNotifier {
       try {
         listed = new Set((await this.ctx.companies.list()).map((company) => company.id).filter(Boolean));
       } catch (err) {
-        if (isInvocationScopeDenial(err)) this.jobCompanyListDenied = true;
         this.ctx.logger.warn("company list unavailable; scanning known companies", {
           error: String(err),
           knownCompanies: known.size,

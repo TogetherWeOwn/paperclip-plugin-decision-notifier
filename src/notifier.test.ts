@@ -637,7 +637,35 @@ describe("scanAll company enumeration", () => {
     expect(calls).toBe(1);
   });
 
-  it("does not retry a scope-denied company list again this session, even past the refresh window", async () => {
+  it("stops refreshing the company list once the job is denied every known company", async () => {
+    const { harness, notifier } = setup();
+    let listCalls = 0;
+    harness.ctx.companies.list = async () => {
+      listCalls++;
+      throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+    };
+    let configCalls = 0;
+    harness.ctx.config.get = async () => {
+      configCalls++;
+      throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+    };
+
+    await notifier.noteCompany(COMPANY);
+    await notifier.scanAll(); // list denied, then the company's scan denied: latched
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + COMPANY_LIST_REFRESH_MS + 1);
+    try {
+      await notifier.scanAll();
+    } finally {
+      now.mockRestore();
+    }
+
+    // Discovering more companies cannot give the job anything it may scan, so
+    // it makes no further call the host would log an error for.
+    expect(listCalls).toBe(1);
+    expect(configCalls).toBe(1);
+  });
+
+  it("keeps retrying a scope-denied company list while the job can still scan a known company", async () => {
     const { harness, notifier } = setup();
     let calls = 0;
     harness.ctx.companies.list = async () => {
@@ -645,6 +673,7 @@ describe("scanAll company enumeration", () => {
       throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
     };
 
+    await notifier.noteCompany(COMPANY); // per-company calls are admitted in this harness
     await notifier.scanAll();
     const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + COMPANY_LIST_REFRESH_MS + 1);
     try {
@@ -653,7 +682,9 @@ describe("scanAll company enumeration", () => {
       now.mockRestore();
     }
 
-    expect(calls).toBe(1);
+    // A wildcard denial is transient (it lifts when no scoped invocation is
+    // active), so a job that can scan keeps its discovery refresh.
+    expect(calls).toBe(2);
   });
 
   it("still retries a company list that failed for a non-scope reason after the refresh window", async () => {
