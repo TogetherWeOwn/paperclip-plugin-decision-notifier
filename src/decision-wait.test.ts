@@ -9,12 +9,17 @@ import { fileURLToPath } from "node:url";
 const SCRIPT = fileURLToPath(new URL("../bin/decision-wait.mjs", import.meta.url));
 const TOKEN = "board-token-123";
 
-const decision = (kind: string, id: string) => ({
+const decision = (kind: string, id: string, extra: Record<string, unknown> = {}) => ({
   kind,
   id,
   issueIdentifier: "TWO-1",
   url: "/TWO/issues/TWO-1",
   createdAt: "2026-10-31T12:00:00.000Z",
+  audience: null,
+  interactionKind: null,
+  originKind: null,
+  originId: null,
+  ...extra,
 });
 
 interface FakeOptions {
@@ -106,11 +111,18 @@ async function fakePaperclip(options: FakeOptions) {
   return { url: `http://127.0.0.1:${port}`, seenAuth, catchUps };
 }
 
-function run(apiUrl: string, seenFile: string, token = TOKEN, extraEnv: Record<string, string> = {}, killAfterMs = 5000) {
+function run(
+  apiUrl: string,
+  seenFile: string,
+  token = TOKEN,
+  extraEnv: Record<string, string> = {},
+  killAfterMs = 5000,
+  extraArgv: string[] = [],
+) {
   const dir = mkdtempSync(join(tmpdir(), "dw-"));
   const tokenFile = join(dir, "token");
   writeFileSync(tokenFile, `${token}\n`);
-  return spawnScript(["--company", "c-1", "--seen", seenFile], { PAPERCLIP_API_URL: `${apiUrl}/api`, PAPERCLIP_BOARD_TOKEN_FILE: tokenFile, ...extraEnv }, killAfterMs);
+  return spawnScript(["--company", "c-1", "--seen", seenFile, ...extraArgv], { PAPERCLIP_API_URL: `${apiUrl}/api`, PAPERCLIP_BOARD_TOKEN_FILE: tokenFile, ...extraEnv }, killAfterMs);
 }
 
 function spawnScript(argv: string[], env: Record<string, string>, killAfterMs = 5000) {
@@ -453,5 +465,124 @@ describe("decision-wait run failures", () => {
     const result = await run(fake.url, tmpFile());
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).kind).toBe("owner_card");
+  });
+});
+
+describe("decision-wait routing filters", () => {
+  const council = (id: string) =>
+    decision("interaction", id, {
+      audience: "board",
+      interactionKind: "request_confirmation",
+      originKind: "plugin:board-council",
+      originId: "council:card:m1:verdict:1",
+    });
+  const ownerDecision = (id: string) => decision("interaction", id, { audience: "owner", interactionKind: "request_confirmation" });
+
+  it("announces only the audience it was asked for, without marking the skipped one seen", async () => {
+    const fake = await fakePaperclip({
+      pending: [council("ix-council")],
+      later: [`data: ${JSON.stringify(ownerDecision("ix-owner"))}\n\n`],
+    });
+    const seen = tmpFile();
+    const result = await run(fake.url, seen, TOKEN, {}, 5000, ["--audience", "owner"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).id).toBe("ix-owner");
+    // The skipped council event was never appended to the seen file.
+    expect(readFileSync(seen, "utf8").split("\n").filter(Boolean)).toEqual(["interaction:ix-owner:2026-10-31T12:00:00.000Z"]);
+  });
+
+  it("prunes the seen file against the unfiltered pending set", async () => {
+    const fake = await fakePaperclip({ pending: [council("ix-council")] });
+    const seen = tmpFile();
+    writeFileSync(seen, "interaction:ix-council:2026-10-31T12:00:00.000Z\ninteraction:ix-gone:2026-10-31T12:00:00.000Z\n");
+    const result = await run(fake.url, seen, TOKEN, {}, 600, ["--audience", "owner"]);
+    // Nothing announced: killed while waiting on the filtered-out stream.
+    expect(result.code).toBeNull();
+    expect(result.stdout).toBe("");
+    // The still-pending council entry is kept even though the filter skips it; the resolved one is pruned.
+    expect(readFileSync(seen, "utf8").split("\n").filter(Boolean)).toEqual(["interaction:ix-council:2026-10-31T12:00:00.000Z"]);
+  });
+
+  it("still announces events with no audience when filtering", async () => {
+    // A 0.2.0 plugin emits no routing fields at all.
+    const legacy = {
+      kind: "interaction",
+      id: "ix-old",
+      issueIdentifier: "TWO-1",
+      url: "/TWO/issues/TWO-1",
+      createdAt: "2026-10-31T12:00:00.000Z",
+    };
+    const fake = await fakePaperclip({ pending: [legacy] });
+    const result = await run(fake.url, tmpFile(), TOKEN, {}, 5000, ["--audience", "owner"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ...legacy,
+      audience: null,
+      interactionKind: null,
+      originKind: null,
+      originId: null,
+    });
+  });
+
+  it("skips excluded origin kinds without marking them seen", async () => {
+    const fake = await fakePaperclip({
+      pending: [council("ix-council")],
+      later: [`data: ${JSON.stringify(decision("approval", "ap-1", { audience: "board" }))}\n\n`],
+    });
+    const seen = tmpFile();
+    const result = await run(fake.url, seen, TOKEN, {}, 5000, ["--exclude-origin-kind", "plugin:board-council"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).id).toBe("ap-1");
+    expect(readFileSync(seen, "utf8").split("\n").filter(Boolean)).toEqual(["approval:ap-1:2026-10-31T12:00:00.000Z"]);
+  });
+
+  it("lets run failures through the audience filter", async () => {
+    const failure = {
+      kind: "run_failure",
+      id: "0123456789abcdef@2026-11-01T10:00:00.000Z",
+      issueIdentifier: "TWO-7",
+      url: "/TWO/agents/agent-1/runs/run-3",
+      createdAt: "2026-11-01T10:00:00.000Z",
+      agentId: "agent-1",
+      agentIds: ["agent-1"],
+      count: 1,
+      firstRunId: "run-1",
+      lastRunId: "run-3",
+      firstFailedAt: "2026-11-01T10:01:00.000Z",
+      lastFailedAt: "2026-11-01T10:01:00.000Z",
+      errorCode: null,
+      error: "boom",
+    };
+    const fake = await fakePaperclip({ pending: [failure] });
+    const result = await run(fake.url, tmpFile(), TOKEN, {}, 5000, ["--audience", "owner"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(failure);
+  });
+
+  it("validates routing fields and caps the origin id", async () => {
+    const wire = {
+      ...decision("interaction", "ix-1"),
+      audience: "everyone",
+      interactionKind: 7,
+      originKind: "plugin:board-council",
+      originId: "x".repeat(500),
+    };
+    const fake = await fakePaperclip({ pending: [], later: [`data: ${JSON.stringify(wire)}\n\n`] });
+    // An unknown audience reads as missing, so the filter passes it rather than dropping it.
+    const result = await run(fake.url, tmpFile(), TOKEN, {}, 5000, ["--audience", "owner"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ...decision("interaction", "ix-1"),
+      audience: null,
+      originKind: "plugin:board-council",
+      originId: "x".repeat(200),
+    });
+  });
+
+  it.each(["everyone", "owner,bogus", ""])("exits 1 on an invalid --audience value (%s)", async (value) => {
+    const fake = await fakePaperclip({ pending: [] });
+    const result = await run(fake.url, tmpFile(), TOKEN, {}, 5000, ["--audience", value]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toBe("decision-wait: --audience must be a comma-separated list of owner, board, anyone\n");
   });
 });

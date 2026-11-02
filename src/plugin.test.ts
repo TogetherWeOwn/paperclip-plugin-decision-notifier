@@ -127,6 +127,10 @@ describe("scan job", () => {
       issueIdentifier: null,
       url: "https://pc.example.com/TWO/approvals/ap-1",
       createdAt: "2026-10-31T12:00:00.000Z",
+      audience: "board",
+      interactionKind: null,
+      originKind: null,
+      originId: null,
     });
     expect(byKind.interaction).toEqual({
       kind: "interaction",
@@ -134,6 +138,10 @@ describe("scan job", () => {
       issueIdentifier: "TWO-1",
       url: "https://pc.example.com/TWO/issues/TWO-1",
       createdAt: "2026-10-31T11:00:00.000Z",
+      audience: "anyone",
+      interactionKind: "request_confirmation",
+      originKind: null,
+      originId: null,
     });
     expect(byKind.owner_card.url).toBe("https://pc.example.com/TWO/issues/TWO-2");
   });
@@ -439,6 +447,110 @@ describe("catch-up", () => {
   });
 });
 
+describe("routing fields", () => {
+  it("derives the audience from the addressee and the resolver policy", async () => {
+    const { harness } = await setup();
+    harness.seed({
+      approvals: [approval("ap-1")],
+      issues: [
+        issue("i-owner", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>),
+        issue("i-plain", "TWO-2"),
+      ],
+      issueInteractions: [
+        interaction("ix-user", "i-plain", { addresseeUserId: OWNER } as Partial<Interaction>),
+        interaction("ix-human", "i-plain", { effectiveResolverPolicy: "human_only" } as Partial<Interaction>),
+        interaction("ix-anyone", "i-plain", { effectiveResolverPolicy: "anyone" } as Partial<Interaction>),
+        interaction("ix-not-creator", "i-plain", { effectiveResolverPolicy: "not_creator" } as Partial<Interaction>),
+      ],
+    });
+    await harness.runJob(SCAN_JOB_KEY);
+    const pending = (await catchUp()).body as { pending: DecisionEvent[] };
+    const audienceOf = (kind: string, id: string) => pending.pending.find((e) => e.kind === kind && e.id === id)?.audience;
+    expect(audienceOf("interaction", "ix-user")).toBe("owner");
+    expect(audienceOf("interaction", "ix-human")).toBe("board");
+    expect(audienceOf("interaction", "ix-anyone")).toBe("anyone");
+    expect(audienceOf("interaction", "ix-not-creator")).toBe("anyone");
+    expect(audienceOf("approval", "ap-1")).toBe("board");
+    expect(audienceOf("owner_card", "i-owner")).toBe("owner");
+  });
+
+  it("passes the interaction kind and the issue origin through", async () => {
+    const { harness } = await setup();
+    harness.seed({
+      approvals: [approval("ap-1")],
+      issues: [
+        issue("i-council", "TWO-9", {
+          originKind: "plugin:board-council",
+          originId: "council:card:m1:verdict:1",
+        } as Partial<Issue>),
+      ],
+      issueInteractions: [interaction("ix-1", "i-council", { kind: "ask_user_questions" } as Partial<Interaction>)],
+    });
+    await harness.runJob(SCAN_JOB_KEY);
+    const pending = (await catchUp()).body as { pending: DecisionEvent[] };
+    const byId = Object.fromEntries(pending.pending.map((e) => [e.id, e]));
+    expect(byId["ix-1"]).toMatchObject({
+      interactionKind: "ask_user_questions",
+      originKind: "plugin:board-council",
+      originId: "council:card:m1:verdict:1",
+    });
+    expect(byId["ap-1"]).toMatchObject({ interactionKind: null, originKind: null, originId: null });
+  });
+
+  it("still excludes agent-addressed interactions", async () => {
+    const { harness, ids } = await setup();
+    harness.seed({
+      issues: [issue("i-1", "TWO-1")],
+      issueInteractions: [
+        interaction("ix-agent", "i-1", { addresseeAgentId: "agent-2" } as Partial<Interaction>),
+        interaction("ix-user-agent", "i-1", {
+          addresseeAgentId: "agent-2",
+          addresseeUserId: OWNER,
+        } as Partial<Interaction>),
+      ],
+    });
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(ids()).toEqual([]);
+  });
+
+  it("normalizes a stale stored entry without re-announcing it", async () => {
+    const { harness, emitted } = await setup();
+    // A pending set written by 0.2.0: full decisions but none of the routing fields.
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: COMPANY, stateKey: "pending" },
+      {
+        "approval:ap-1": {
+          kind: "approval",
+          id: "ap-1",
+          issueIdentifier: null,
+          url: "/TWO/approvals/ap-1",
+          createdAt: "2026-10-31T12:00:00.000Z",
+        },
+      },
+    );
+    harness.seed({ approvals: [approval("ap-1")] });
+    const response = await catchUp();
+    const pending = (response.body as { pending: DecisionEvent[] }).pending;
+    expect(pending).toEqual([
+      {
+        kind: "approval",
+        id: "ap-1",
+        issueIdentifier: null,
+        url: "/TWO/approvals/ap-1",
+        createdAt: "2026-10-31T12:00:00.000Z",
+        audience: "board",
+        interactionKind: null,
+        originKind: null,
+        originId: null,
+      },
+    ]);
+    // A catch-up replay, not a new announcement: nothing new hits the stream.
+    expect(emitted.map((e) => `${e.event.kind}:${e.event.id}`)).toEqual(["approval:ap-1"]);
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(emitted).toHaveLength(1);
+  });
+});
+
 describe("no payload text", () => {
   it("never puts titles, summaries, payloads or names on the stream", async () => {
     const { harness, emitted } = await setup();
@@ -453,7 +565,17 @@ describe("no payload text", () => {
 
     expect(emitted.length).toBeGreaterThan(0);
     for (const { event } of emitted) {
-      expect(Object.keys(event).sort()).toEqual(["createdAt", "id", "issueIdentifier", "kind", "url"]);
+      expect(Object.keys(event).sort()).toEqual([
+        "audience",
+        "createdAt",
+        "id",
+        "interactionKind",
+        "issueIdentifier",
+        "kind",
+        "originId",
+        "originKind",
+        "url",
+      ]);
       expect(JSON.stringify(event)).not.toContain("secret-payload");
       expect(JSON.stringify(event)).not.toContain("IGNORE");
     }

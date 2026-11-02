@@ -22,9 +22,15 @@ type Approval = Awaited<ReturnType<PluginContext["approvals"]["list"]>>[number];
 export type DecisionKind = "approval" | "interaction" | "owner_card";
 export type EventKind = DecisionKind | "run_failure";
 
+/** Who should act on a decision event. A routing hint for wake-up/skip decisions, never authorization. */
+export type DecisionAudience = "owner" | "board" | "anyone";
+
+const AUDIENCES: readonly DecisionAudience[] = ["owner", "board", "anyone"];
+
 /**
- * The only shape that ever leaves the plugin. IDs and URLs only: titles,
- * summaries, payloads and comments are untrusted text and stay in Paperclip.
+ * The only shape that ever leaves the plugin. IDs, URLs and host-derived
+ * routing fields only: titles, summaries, payloads and comments are untrusted
+ * text and stay in Paperclip.
  */
 export interface DecisionEvent {
   kind: DecisionKind;
@@ -32,6 +38,12 @@ export interface DecisionEvent {
   issueIdentifier: string | null;
   url: string;
   createdAt: string;
+  audience: DecisionAudience;
+  /** The interaction's `kind` for interactions, `null` otherwise. */
+  interactionKind: string | null;
+  /** The issue's `originKind`/`originId`, `null` when the event belongs to no issue. */
+  originKind: string | null;
+  originId: string | null;
 }
 
 /**
@@ -122,7 +134,21 @@ const runCursorStateKey = (companyId: string) => companyStateKey(companyId, "run
 
 export function toEvent(decision: DecisionEvent): DecisionEvent {
   const { kind, id, issueIdentifier, url, createdAt } = decision;
-  return { kind, id, issueIdentifier, url, createdAt };
+  // Stored entries from before these fields existed normalize here, so a
+  // catch-up replay in the first minute after upgrade emits the full shape.
+  // The fail-safe audience is "board": a human looks, never "anyone".
+  const raw = decision as Partial<Record<"audience" | "interactionKind" | "originKind" | "originId", unknown>>;
+  return {
+    kind,
+    id,
+    issueIdentifier,
+    url,
+    createdAt,
+    audience: AUDIENCES.includes(raw.audience as DecisionAudience) ? (raw.audience as DecisionAudience) : "board",
+    interactionKind: typeof raw.interactionKind === "string" ? raw.interactionKind : null,
+    originKind: typeof raw.originKind === "string" ? raw.originKind : null,
+    originId: typeof raw.originId === "string" ? raw.originId : null,
+  };
 }
 
 export function toRunFailureEvent(group: RunFailureEvent): RunFailureEvent {
@@ -612,6 +638,17 @@ export class DecisionNotifier {
     return interaction.status === "pending" && !interaction.addresseeAgentId;
   }
 
+  /**
+   * Routing hint for an interaction: a user addressee needs that user, a
+   * `human_only` interaction needs a human on the board, and anything else
+   * any agent consumer may resolve.
+   */
+  private interactionAudience(interaction: Interaction): DecisionAudience {
+    if (interaction.addresseeUserId) return "owner";
+    if (interaction.effectiveResolverPolicy === "human_only") return "board";
+    return "anyone";
+  }
+
   private async interactionDecisions(companyId: string, issue: Issue, config: NotifierConfig): Promise<PendingMap> {
     const out: PendingMap = {};
     const interactions = await this.ctx.issues.listInteractions(issue.id, companyId);
@@ -624,6 +661,10 @@ export class DecisionNotifier {
         issueIdentifier: issue.identifier,
         url: this.issueUrl(issue, config),
         createdAt: isoString(interaction.createdAt),
+        audience: this.interactionAudience(interaction),
+        interactionKind: interaction.kind,
+        originKind: issue.originKind ?? null,
+        originId: issue.originId ?? null,
       };
     }
     return out;
@@ -638,6 +679,10 @@ export class DecisionNotifier {
       url: this.issueUrl(issue, config),
       // The card's last change is the closest available stamp for the assignment.
       createdAt: isoString(issue.updatedAt),
+      audience: "owner",
+      interactionKind: null,
+      originKind: issue.originKind ?? null,
+      originId: issue.originId ?? null,
     };
   }
 
@@ -649,6 +694,10 @@ export class DecisionNotifier {
       issueIdentifier: null,
       url: `${config.publicBaseUrl}/${config.prefix}/approvals/${encodeURIComponent(approval.id)}`,
       createdAt: isoString(approval.createdAt),
+      audience: "board",
+      interactionKind: null,
+      originKind: null,
+      originId: null,
     };
   }
 

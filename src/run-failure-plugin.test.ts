@@ -613,7 +613,17 @@ describe("existing kinds", () => {
     const decisions = [...emitted, ...pending].filter((e) => e.kind !== "run_failure");
     expect(decisions.length).toBeGreaterThan(0);
     for (const event of decisions) {
-      expect(Object.keys(event).sort()).toEqual(["createdAt", "id", "issueIdentifier", "kind", "url"]);
+      expect(Object.keys(event).sort()).toEqual([
+        "audience",
+        "createdAt",
+        "id",
+        "interactionKind",
+        "issueIdentifier",
+        "kind",
+        "originId",
+        "originKind",
+        "url",
+      ]);
     }
     expect(pending.map((e) => e.kind).sort()).toEqual(["owner_card", "run_failure"]);
   });

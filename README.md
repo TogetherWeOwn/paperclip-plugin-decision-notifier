@@ -27,10 +27,23 @@ Thread interactions are not plugin events in Paperclip 2026.1023.0. Until [paper
 Every decision event (`approval`, `interaction`, `owner_card`) on the `decisions` channel has exactly this shape:
 
 ```json
-{"kind":"interaction","id":"…","issueIdentifier":"TWO-214","url":"https://paperclip.example.com/TWO/issues/TWO-214","createdAt":"2026-10-31T11:00:00.000Z"}
+{"kind":"interaction","id":"…","issueIdentifier":"TWO-214","url":"https://paperclip.example.com/TWO/issues/TWO-214","createdAt":"2026-10-31T11:00:00.000Z","audience":"board","interactionKind":"request_confirmation","originKind":null,"originId":null}
 ```
 
 There is no title, summary, payload or comment text. That text is written by agents and users and is untrusted, so a consumer must re-read the item from Paperclip before acting on it. `issueIdentifier` is `null` for approvals. For owner cards `createdAt` is the card's last update when it was first seen.
+
+The four routing fields are host-derived hints for wake-up/skip decisions, never authorization:
+
+- `audience` is one of `owner`, `board` or `anyone`. An interaction addressed to a user is `owner`; otherwise an interaction whose effective resolver policy is `human_only` is `board`; anything else is `anyone`. Approvals are `board`; owner-assigned cards are `owner`.
+- `interactionKind` is the interaction's kind (`request_confirmation`, `ask_user_questions`, …) for interactions, `null` otherwise.
+- `originKind` / `originId` are the issue's origin, passed through verbatim and never parsed by this plugin; they are `null` for approvals, which belong to no issue. Events on cards the board council created carry `originKind: "plugin:board-council"`.
+
+Consumer rules (binding on the operator session and any stream consumer):
+
+- `audience` is advisory routing only. A consumer re-reads the interaction (addressee, effective policy, status) before acting; events from older plugin versions have no audience and must still be announced, never silently dropped.
+- `originKind: "plugin:board-council"` means hands off: never resolve, skip or cancel such an event. The announcement exists so a human-facing session can see that an owner window is open.
+- `audience: "owner"` means only that user resolves it. Agent consumers take no action except, where their instructions allow, reminding the owner out-of-band.
+- Once the council is live, `audience: "anyone"` interactions in board-decision categories are instruction-compliance failures (the requesting agent skipped the council route). The operator does not resolve them; it comments with the correct route and the creator withdraws and reopens as a matter. These events are countable from the catch-up list (`audience: "anyone"`, `originKind` not `plugin:board-council`, by `interactionKind` and `createdAt`); the plugin keeps no counters of its own.
 
 A `run_failure` adds grouping fields and a short error excerpt, because a failed run is useless to the operator without at least a hint of why:
 
@@ -67,7 +80,7 @@ PAPERCLIP_BOARD_TOKEN_FILE=$HOME/.paperclip/board-token \
 paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-decisions-seen
 ```
 
-- `--company` is required. `--api` overrides `PAPERCLIP_API_URL`; a trailing `/api` is stripped from either. `--plugin` overrides the plugin ID (default `togetherweown.decision-notifier`).
+- `--company` is required. `--api` overrides `PAPERCLIP_API_URL`; a trailing `/api` is stripped from either. `--plugin` overrides the plugin ID (default `togetherweown.decision-notifier`). `--audience <csv>` wakes only for decisions with one of the listed audiences (`owner`, `board`, `anyone`); anything else is silently skipped and never marked seen. `--exclude-origin-kind <csv>` skips events whose `originKind` is listed (for example `plugin:board-council`), also without marking them seen. With neither flag the waiter behaves exactly as before. Events with no audience (older plugins) always pass `--audience`, and `run_failure` items ignore it entirely.
 - The token is read from a file, never from argv.
 - `--seen` lists announced decisions as `kind:id:createdAt`. Replayed decisions already in it do not wake the caller; entries that are no longer pending are pruned on connect. A card that is unassigned and reassigned gets a new `createdAt`, so it announces again. Use one waiter per `--seen` file; the file is not locked across processes.
 - A decision is marked seen only after stdout has accepted it.
