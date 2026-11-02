@@ -413,6 +413,26 @@ describe("event-triggered scans", () => {
     });
   });
 
+  it("still reconciles on a later event when a run-failure event claimed the scan slot without reconciling", async () => {
+    const { harness, notifier } = setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    let cursorReads = 0;
+    const get = harness.ctx.state.get.bind(harness.ctx.state);
+    harness.ctx.state.get = async (key) => {
+      if (key.stateKey === "run-failure-cursor") cursorReads++;
+      return get(key);
+    };
+
+    // A run-failure event claims the slot for a decision-only scan...
+    await notifier.scanFromEventIfDue(COMPANY, { reconcile: false });
+    expect(cursorReads).toBe(0);
+    // ...and an event inside the scan interval must still get its reconciliation.
+    await notifier.scanFromEventIfDue(COMPANY);
+
+    expect(cursorReads).toBe(1);
+    expect(harness.logs.filter((log) => log.message === "decision scan completed")).toHaveLength(1);
+  });
+
   it("ignores a missing company id", async () => {
     const { harness, notifier } = setup();
     await notifier.scanFromEventIfDue(null);

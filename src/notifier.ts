@@ -289,7 +289,13 @@ export class DecisionNotifier {
     if (!companyId) return;
     const now = Date.now();
     const last = this.lastEventScanAt.get(companyId);
-    if (last !== undefined && now - last >= 0 && now - last < EVENT_SCAN_INTERVAL_MS) return;
+    if (last !== undefined && now - last >= 0 && now - last < EVENT_SCAN_INTERVAL_MS) {
+      // The slot may have been claimed by a decision-only scan (a run-failure
+      // event): reconciliation has its own throttle, so it is not throttled
+      // along with the scan slot.
+      if (options.reconcile !== false) await this.tryReconcile(companyId, "event");
+      return;
+    }
     // Claim the slot before scanning, so events landing mid-scan do not pile up a second one.
     this.lastEventScanAt.set(companyId, now);
     await this.scanAndReconcile(companyId, "event", options.reconcile !== false);
@@ -303,7 +309,11 @@ export class DecisionNotifier {
     } catch (err) {
       this.logScanFailure("decision scan failed", companyId, source, err);
     }
-    if (!reconcile) return;
+    if (reconcile) await this.tryReconcile(companyId, source);
+  }
+
+  /** Reconcile one company's failed runs (self-throttled), logging a failure without throwing. */
+  private async tryReconcile(companyId: string, source: "job" | "event"): Promise<void> {
     try {
       await this.reconcileRunFailures(companyId);
     } catch (err) {
