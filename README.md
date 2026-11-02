@@ -22,6 +22,8 @@ Failures are grouped: one item per normalised error signature and fixed window (
 
 Thread interactions are not plugin events in Paperclip 2026.1023.0. Until [paperclipai/paperclip#4990](https://github.com/paperclipai/paperclip/pull/4990) ships, a scan job (`* * * * *`) finds them, so a new interaction reaches the stream within about a minute. Approvals and owner cards arrive as soon as Paperclip delivers the event.
 
+The scan covers the companies the plugin has been invoked for — via events, `company.created`, or the catch-up route — remembered in plugin state, with the full company list re-read as a refresh at most every 15 minutes when the host allows it. A scheduled job runs without a company invocation scope, and listing all companies is exactly the call such a caller may not be granted, so the scan never depends on it.
+
 ## Events
 
 Every decision event (`approval`, `interaction`, `owner_card`) on the `decisions` channel has exactly this shape:
