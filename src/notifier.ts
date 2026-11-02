@@ -118,6 +118,17 @@ export const RUN_RECONCILE_INTERVAL_MS = 5 * 60_000;
 export const RUN_RECONCILE_OVERLAP_MS = 60_000;
 /** Runs `ctx.issues.summaries.getOrchestration` returns per card; it takes no paging parameter. */
 const RUN_PAGE_LIMIT = 100;
+/**
+ * How often the scan job may re-read the full company list. A scheduled job
+ * runs without a company invocation scope, and `companies.list` is a wildcard
+ * call: hosts that gate worker calls by invocation scope never grant it to a
+ * scopeless caller while any scoped invocation (e.g. an event delivery,
+ * whose scope outlives the handler) is still active. In a busy instance that
+ * is effectively always, so the scan works from the companies it has been
+ * invoked for and treats the list as an occasional refresh, never a
+ * requirement.
+ */
+export const COMPANY_LIST_REFRESH_MS = 15 * 60_000;
 /** Group id of the item that collects a window's distinct failures past the cap. */
 const OVERFLOW_GROUP = "overflow";
 const overflowError = (distinct: number) => `${distinct} more distinct failure${distinct === 1 ? "" : "s"}`;
@@ -128,6 +139,8 @@ const companyStateKey = (companyId: string, stateKey: string) => ({
   scopeId: companyId,
   stateKey,
 });
+/** Companies the scan job covers: instance-scoped, so the scopeless job can read it. */
+const knownCompaniesStateKey = { scopeKind: "instance" as const, stateKey: "known-companies" };
 const pendingStateKey = (companyId: string) => companyStateKey(companyId, "pending");
 const runFailuresStateKey = (companyId: string) => companyStateKey(companyId, "run-failures");
 const runCursorStateKey = (companyId: string) => companyStateKey(companyId, "run-failure-cursor");
@@ -210,23 +223,106 @@ export class DecisionNotifier {
   private readonly lastCatchUpScan = new Map<string, { at: number; config: string }>();
   /** When each company's failed runs were last reconciled. */
   private readonly lastRunReconcile = new Map<string, number>();
+  /** Companies this worker has been invoked for, once loaded from state. */
+  private knownCompanies: Set<string> | null = null;
+  private knownCompaniesLoad: Promise<Set<string>> | null = null;
+  /** The last `companies.list` attempt (success or failure) by this worker. */
+  private lastCompanyListAttempt: number | null = null;
 
   constructor(private readonly ctx: PluginContext) {}
 
-  /** Reconcile every company. One failing company, or one failing part, does not stop the others. */
+  /** Reconcile every known company. One failing company, or one failing part, does not stop the others. */
   async scanAll(): Promise<void> {
-    const companies = await this.ctx.companies.list();
-    for (const company of companies) {
+    for (const companyId of await this.companiesToScan()) {
       try {
-        await this.scanCompany(company.id);
+        await this.scanCompany(companyId);
       } catch (err) {
-        this.ctx.logger.error("decision scan failed", { companyId: company.id, error: String(err) });
+        this.ctx.logger.error("decision scan failed", { companyId, error: String(err) });
       }
       try {
-        await this.reconcileRunFailures(company.id);
+        await this.reconcileRunFailures(companyId);
       } catch (err) {
-        this.ctx.logger.error("run failure reconciliation failed", { companyId: company.id, error: String(err) });
+        this.ctx.logger.error("run failure reconciliation failed", { companyId, error: String(err) });
       }
+    }
+  }
+
+  /**
+   * Remember a company the plugin was invoked for, so the scopeless scan job
+   * covers it without enumerating all companies. Best-effort: a failed
+   * persist keeps the in-memory entry and never fails the caller's work.
+   */
+  async noteCompany(companyId: string | null | undefined): Promise<void> {
+    if (!companyId) return;
+    const known = await this.loadKnownCompanies();
+    if (known.has(companyId)) return;
+    known.add(companyId);
+    await this.saveKnownCompanies(known);
+  }
+
+  /**
+   * The companies one scan covers: the remembered set, refreshed from
+   * `companies.list` when it is empty or the last attempt is at least
+   * COMPANY_LIST_REFRESH_MS old. A denied or failing list call (see
+   * COMPANY_LIST_REFRESH_MS) falls back to the remembered set — enumerating
+   * companies must never fail the job while its per-company calls still work.
+   */
+  private async companiesToScan(): Promise<string[]> {
+    const known = await this.loadKnownCompanies();
+    const now = Date.now();
+    const sinceAttempt = this.lastCompanyListAttempt === null ? null : now - this.lastCompanyListAttempt;
+    // A negative age means the clock moved back; wait for it to pass the attempt again.
+    const due = known.size === 0 || sinceAttempt === null || sinceAttempt >= COMPANY_LIST_REFRESH_MS;
+    if (!due) return [...known];
+    this.lastCompanyListAttempt = now;
+    try {
+      const listed = new Set((await this.ctx.companies.list()).map((company) => company.id).filter(Boolean));
+      // An empty list would silently stop every scan; it is only believable
+      // when nothing is remembered either.
+      if (listed.size === 0 && known.size > 0) return [...known];
+      if (listed.size !== known.size || [...listed].some((id) => !known.has(id))) {
+        this.knownCompanies = listed;
+        await this.saveKnownCompanies(listed);
+      }
+      return [...listed];
+    } catch (err) {
+      this.ctx.logger.warn("company list unavailable; scanning known companies", {
+        error: String(err),
+        knownCompanies: known.size,
+      });
+      return [...known];
+    }
+  }
+
+  private loadKnownCompanies(): Promise<Set<string>> {
+    if (this.knownCompanies) return Promise.resolve(this.knownCompanies);
+    this.knownCompaniesLoad ??= (async () => {
+      let loaded: Set<string>;
+      try {
+        const value = await this.ctx.state.get(knownCompaniesStateKey);
+        loaded = new Set(
+          Array.isArray(value) ? value.filter((id): id is string => typeof id === "string" && id.length > 0) : [],
+        );
+      } catch (err) {
+        this.ctx.logger.warn("known companies unavailable; starting empty", { error: String(err) });
+        loaded = new Set();
+      }
+      // Companies noted while the load was in flight are already in the live set.
+      if (this.knownCompanies) {
+        for (const id of loaded) this.knownCompanies.add(id);
+      } else {
+        this.knownCompanies = loaded;
+      }
+      return this.knownCompanies;
+    })();
+    return this.knownCompaniesLoad;
+  }
+
+  private async saveKnownCompanies(known: Set<string>): Promise<void> {
+    try {
+      await this.ctx.state.set(knownCompaniesStateKey, [...known]);
+    } catch (err) {
+      this.ctx.logger.warn("could not persist known companies", { error: String(err) });
     }
   }
 
@@ -235,6 +331,7 @@ export class DecisionNotifier {
    * and forget the ones that are no longer pending. Returns all pending events.
    */
   async scanCompany(companyId: string, options: { emitNew?: boolean } = {}): Promise<DecisionEvent[]> {
+    await this.noteCompany(companyId);
     // Collect under the lock too, so an event landing mid-scan is not dropped
     // from the stored set and re-announced by the next scan.
     return this.withLock(companyId, () => this.scanLocked(companyId, options.emitNew !== false));
@@ -252,6 +349,7 @@ export class DecisionNotifier {
    * are replayed too; they are kept current by events and the scan job.
    */
   async catchUp(companyId: string): Promise<NotifierEvent[]> {
+    await this.noteCompany(companyId);
     const pending = await this.withLock(companyId, async () => {
       const config = await this.config(companyId);
       const configKey = JSON.stringify(config);
@@ -279,6 +377,7 @@ export class DecisionNotifier {
 
   /** Count one failed run from an `agent.run.failed` event. Cancelled runs never get here. */
   async onRunFailedEvent(companyId: string, payload: unknown, occurredAt: string, entityId?: string): Promise<void> {
+    await this.noteCompany(companyId);
     const run = failedRunFromEvent(payload, occurredAt, entityId);
     if (!run) return;
     await this.withLock(companyId, async () => {
@@ -339,6 +438,7 @@ export class DecisionNotifier {
   }
 
   async onApprovalEvent(companyId: string, approvalId: string | undefined): Promise<void> {
+    await this.noteCompany(companyId);
     if (!approvalId) return;
     // Read inside the lock: a read taken before a concurrent scan could
     // otherwise restore a decision the scan just saw resolved.
@@ -358,6 +458,7 @@ export class DecisionNotifier {
 
   /** Re-evaluate one card: its owner assignment and its thread interactions. */
   async onIssueEvent(companyId: string, issueId: string | undefined): Promise<void> {
+    await this.noteCompany(companyId);
     if (!issueId) return;
     await this.withLock(companyId, async () => {
       const config = await this.config(companyId);

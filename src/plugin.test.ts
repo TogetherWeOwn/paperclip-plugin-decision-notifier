@@ -157,6 +157,25 @@ describe("scan job", () => {
     await harness.runJob(SCAN_JOB_KEY);
     expect(ids()).toEqual(["owner_card:i-1"]);
   });
+
+  it("scans a company learned from company.created when companies.list is denied", async () => {
+    const { harness, ids } = await setup();
+    const OTHER = "c-2";
+    // A scopeless job gets no wildcard grant while any scoped invocation is
+    // active; simulate that host by denying the list outright.
+    harness.ctx.companies.list = async () => {
+      throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+    };
+    harness.seed({
+      companies: [company(), company(OTHER, "OTH")],
+      approvals: [approval("ap-other", { companyId: OTHER } as Partial<Approval>)],
+    });
+
+    await harness.emit("company.created", {}, { companyId: OTHER, entityId: OTHER });
+    await harness.runJob(SCAN_JOB_KEY);
+
+    expect(ids()).toEqual(["approval:ap-other"]);
+  });
 });
 
 describe("dedupe", () => {

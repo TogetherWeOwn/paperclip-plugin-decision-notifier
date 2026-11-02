@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest from "./manifest.js";
 import {
+  COMPANY_LIST_REFRESH_MS,
   DecisionNotifier,
   INTERACTION_ISSUE_STATUSES,
   OPEN_ISSUE_STATUSES,
@@ -366,5 +367,82 @@ describe("scanAll error isolation", () => {
       message: "run failure reconciliation failed",
       meta: { companyId: COMPANY, error: "Error: state down" },
     });
+  });
+});
+
+describe("scanAll company enumeration", () => {
+  const denyList = (harness: TestHarness) => {
+    harness.ctx.companies.list = async () => {
+      throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+    };
+  };
+
+  it("reads the company list at most once per refresh window", async () => {
+    const { harness, notifier } = setup();
+    let calls = 0;
+    const list = harness.ctx.companies.list.bind(harness.ctx.companies);
+    harness.ctx.companies.list = async (...args) => {
+      calls++;
+      return list(...args);
+    };
+
+    await notifier.scanAll();
+    await notifier.scanAll();
+
+    expect(calls).toBe(1);
+  });
+
+  it("keeps scanning known companies when the host denies companies.list", async () => {
+    const { harness, emitted, notifier } = setup();
+    harness.seed({ approvals: [approval("ap-1")] });
+    await notifier.scanAll(); // list still readable: learns and persists the company set
+    expect(emitted.map((e) => e.id)).toEqual(["ap-1"]);
+
+    denyList(harness);
+    harness.seed({ approvals: [approval("ap-1"), approval("ap-2")] });
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + COMPANY_LIST_REFRESH_MS + 1);
+    try {
+      await notifier.scanAll();
+    } finally {
+      now.mockRestore();
+    }
+
+    expect(emitted.map((e) => e.id)).toEqual(["ap-1", "ap-2"]);
+    expect(harness.logs).toContainEqual({
+      level: "warn",
+      message: "company list unavailable; scanning known companies",
+      meta: {
+        error: "Error: the worker referenced a missing, expired, or unknown invocation scope",
+        knownCompanies: 1,
+      },
+    });
+  });
+
+  it("scans a company learned from an event, across a worker restart, without companies.list", async () => {
+    const { harness, emitted, notifier } = setup();
+    denyList(harness);
+    harness.seed({ approvals: [approval("ap-1")] });
+
+    await notifier.onApprovalEvent(COMPANY, "ap-1");
+    harness.seed({ approvals: [approval("ap-1"), approval("ap-2")] });
+    await notifier.scanAll();
+    expect(emitted.map((e) => e.id)).toEqual(["ap-1", "ap-2"]);
+
+    // A new notifier on the same store (worker restart) reloads the remembered set.
+    const restarted = new DecisionNotifier(harness.ctx);
+    harness.seed({ approvals: [approval("ap-1"), approval("ap-2"), approval("ap-3")] });
+    await restarted.scanAll();
+    expect(emitted.map((e) => e.id)).toEqual(["ap-1", "ap-2", "ap-3"]);
+  });
+
+  it("does not let an empty company list wipe the remembered companies", async () => {
+    const { harness, emitted, notifier } = setup();
+    await notifier.noteCompany(COMPANY);
+    harness.ctx.companies.list = async () => [];
+    harness.seed({ approvals: [approval("ap-1")] });
+
+    await notifier.scanAll();
+
+    expect(emitted.map((e) => e.id)).toEqual(["ap-1"]);
   });
 });

@@ -4,6 +4,10 @@
 
 (nothing yet)
 
+## 0.3.1
+
+- Fixed the `decision-scan` job failing with "the worker referenced a missing, expired, or unknown invocation scope" on hosts that gate worker calls by invocation scope. A scheduled job runs scopeless, and the scan's first call, `companies.list`, is a wildcard call such hosts never grant to a scopeless caller while any scoped invocation (for example, an event delivery, whose scope outlives its handler) is still active — in a busy instance, effectively always. The scan now works from the companies the plugin has been invoked for (events, the catch-up route, and a new `company.created` subscription), persisted in instance-scoped state, and re-reads the full company list only as a refresh at most every 15 minutes, falling back to the remembered set when the list call is denied. Event, catch-up and stream behavior is unchanged.
+
 ## 0.3.0
 
 - Also ships the previously unreleased `run_failure` grouping fix: a group that started with no error text now adopts the error the reconciliation later recovers for the same run, instead of splitting the failure mode in two.
@@ -11,10 +15,6 @@
 - Stored pending entries from 0.2.0 normalize on the way out (missing `audience` becomes `board`, the fail-safe; the rest become `null`), so a catch-up replay in the first minute after upgrade emits the full shape without re-announcing anything (dedupe keys are still `kind:id`).
 - `paperclip-decision-wait` accepts and prints the new fields (validating them, capping `originId` at 200 characters) and adds `--audience <csv>` and `--exclude-origin-kind <csv>` filters: with neither flag behavior is exactly as before; a filtered-out event is neither announced nor marked seen; pruning still compares the seen file against the unfiltered pending set; events with no audience always pass the audience filter; `run_failure` ignores it.
 - README documents the consumer rules: audience is advisory (re-read before acting), `plugin:board-council` origin means hands off, `owner` audience means only that user resolves, and `anyone` interactions in board-decision categories are instruction-compliance failures the operator bounces with a comment instead of resolving.
-
-## Unreleased
-
-- Fixed `run_failure` grouping splitting a failure mode in two when an `agent.run.failed` event carried no error text. The blank-excerpt group now adopts the error the reconciliation later recovers for the same run — moving to that error's signature in the same window, or folding into the group (or overflow item) already standing in for it — so later runs with that error join the one group.
 
 ## 0.2.0
 

@@ -31,6 +31,12 @@ const plugin = definePlugin({
     ctx.events.on("agent.run.failed", async (event) => {
       await current.onRunFailedEvent(event.companyId, event.payload, event.occurredAt, event.entityId);
     });
+    // The scan job covers the companies the plugin has been invoked for; a
+    // company created after startup joins that set here, before it necessarily
+    // produces one of the events above.
+    ctx.events.on("company.created", async (event) => {
+      await current.noteCompany(event.companyId ?? event.entityId);
+    });
   },
 
   async onApiRequest(input: PluginApiRequestInput): Promise<PluginApiResponse> {
