@@ -34,6 +34,8 @@ const KEEPALIVE_MS = 60_000;
 const KINDS = new Set(["approval", "interaction", "owner_card", "run_failure"]);
 /** The plugin caps run failure excerpts at 200 characters; enforce it here too. */
 const ERROR_EXCERPT_CHARS = 200;
+/** Advisory routing audiences on decision events. */
+const AUDIENCES = new Set(["owner", "board", "anyone"]);
 
 const { values: args } = parseArgs({
   options: {
@@ -41,6 +43,8 @@ const { values: args } = parseArgs({
     plugin: { type: "string", default: DEFAULT_PLUGIN },
     seen: { type: "string" },
     api: { type: "string" },
+    audience: { type: "string" },
+    "exclude-origin-kind": { type: "string" },
   },
 });
 
@@ -48,6 +52,23 @@ function fail(message) {
   process.stderr.write(`decision-wait: ${message}\n`);
   process.exit(1);
 }
+
+const parseCsv = (value) =>
+  value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+let audienceFilter = null;
+if (args.audience !== undefined) {
+  const values = parseCsv(args.audience);
+  if (values.length === 0 || values.some((value) => !AUDIENCES.has(value))) {
+    fail(`--audience must be a comma-separated list of ${[...AUDIENCES].join(", ")}`);
+  }
+  audienceFilter = new Set(values);
+}
+// Origin kinds to skip. Any string is a valid kind; an empty list skips nothing.
+const excludeOriginKinds = args["exclude-origin-kind"] !== undefined ? new Set(parseCsv(args["exclude-origin-kind"])) : null;
 
 const apiBase = (args.api ?? process.env.PAPERCLIP_API_URL ?? "").replace(/\/+$/, "").replace(/\/api$/, "");
 const tokenFile = process.env.PAPERCLIP_BOARD_TOKEN_FILE;
@@ -74,7 +95,7 @@ function parseDecision(data) {
     return null;
   }
   if (!event || typeof event !== "object") return null;
-  const { kind, id, issueIdentifier, url, createdAt } = event;
+  const { kind, id, issueIdentifier, url, createdAt, audience, interactionKind, originKind, originId } = event;
   if (!KINDS.has(kind) || typeof id !== "string" || typeof url !== "string") return null;
   const decision = {
     kind,
@@ -83,7 +104,17 @@ function parseDecision(data) {
     url,
     createdAt: typeof createdAt === "string" ? createdAt : null,
   };
-  return kind === "run_failure" ? parseRunFailure(decision, event) : decision;
+  if (kind === "run_failure") return parseRunFailure(decision, event);
+  // Routing fields are advisory: an unknown or missing audience reads as null
+  // (announce it anyway; mixed-version rollouts must never drop a decision).
+  // originId is host text; cap it like the error excerpt.
+  return {
+    ...decision,
+    audience: AUDIENCES.has(audience) ? audience : null,
+    interactionKind: typeof interactionKind === "string" ? interactionKind : null,
+    originKind: typeof originKind === "string" ? originKind : null,
+    originId: typeof originId === "string" ? originId.slice(0, ERROR_EXCERPT_CHARS) : null,
+  };
 }
 
 /** Run failures add grouping fields and a redacted error excerpt (still untrusted text). */
@@ -110,8 +141,22 @@ function parseRunFailure(decision, event) {
 // reassigned between two runs gets a new createdAt, so it announces again.
 const seenKey = (decision) => `${decision.kind}:${decision.id}:${decision.createdAt ?? ""}`;
 
+/**
+ * Advisory routing: a filtered-out decision is neither announced nor marked
+ * seen, so changing flags between runs does not lose it. Events with no
+ * audience (older plugins) always pass the audience filter, and run failures
+ * ignore it entirely.
+ */
+function passesFilters(decision) {
+  if (decision.kind === "run_failure") return true;
+  if (audienceFilter && decision.audience !== null && !audienceFilter.has(decision.audience)) return false;
+  if (excludeOriginKinds && decision.originKind !== null && excludeOriginKinds.has(decision.originKind)) return false;
+  return true;
+}
+
 /** Print an unseen decision; mark it seen only once stdout has taken it, then exit 0. */
 function announce(decision) {
+  if (!passesFilters(decision)) return false;
   const key = seenKey(decision);
   if (seen.has(key)) return false;
   process.stdout.write(`${JSON.stringify(decision)}\n`, (err) => {

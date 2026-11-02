@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+(nothing yet)
+
+## 0.3.0
+
+- Also ships the previously unreleased `run_failure` grouping fix: a group that started with no error text now adopts the error the reconciliation later recovers for the same run, instead of splitting the failure mode in two.
+- Decision events carry advisory routing fields: `audience` (`owner`/`board`/`anyone`, derived from the interaction addressee and resolver policy; approvals are `board`, owner cards are `owner`), `interactionKind`, and the issue's `originKind`/`originId` passed through verbatim (`null` for approvals). `RunFailureEvent` is unchanged. No new manifest capabilities: the host already returns these fields under `issues.read` + `issue.interactions.read`.
+- Stored pending entries from 0.2.0 normalize on the way out (missing `audience` becomes `board`, the fail-safe; the rest become `null`), so a catch-up replay in the first minute after upgrade emits the full shape without re-announcing anything (dedupe keys are still `kind:id`).
+- `paperclip-decision-wait` accepts and prints the new fields (validating them, capping `originId` at 200 characters) and adds `--audience <csv>` and `--exclude-origin-kind <csv>` filters: with neither flag behavior is exactly as before; a filtered-out event is neither announced nor marked seen; pruning still compares the seen file against the unfiltered pending set; events with no audience always pass the audience filter; `run_failure` ignores it.
+- README documents the consumer rules: audience is advisory (re-read before acting), `plugin:board-council` origin means hands off, `owner` audience means only that user resolves, and `anyone` interactions in board-decision categories are instruction-compliance failures the operator bounces with a comment instead of resolving.
+
+## Unreleased
+
 - Fixed `run_failure` grouping splitting a failure mode in two when an `agent.run.failed` event carried no error text. The blank-excerpt group now adopts the error the reconciliation later recovers for the same run — moving to that error's signature in the same window, or folding into the group (or overflow item) already standing in for it — so later runs with that error join the one group.
 
 ## 0.2.0

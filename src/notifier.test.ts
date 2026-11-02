@@ -63,7 +63,7 @@ function setup(config: Record<string, unknown> = {}) {
 }
 
 describe("public event shapes", () => {
-  it("toEvent keeps only the five public fields, dropping the stored issue id", () => {
+  it("toEvent keeps only the nine public fields, dropping the stored issue id", () => {
     const stored = {
       kind: "interaction",
       id: "ix-1",
@@ -71,6 +71,10 @@ describe("public event shapes", () => {
       issueIdentifier: "TWO-1",
       url: "https://pc.example.com/TWO/issues/TWO-1",
       createdAt: "2026-10-31T11:00:00.000Z",
+      audience: "board",
+      interactionKind: "request_confirmation",
+      originKind: null,
+      originId: null,
       title: "untrusted",
     } as unknown as DecisionEvent;
     const event = toEvent(stored);
@@ -80,8 +84,71 @@ describe("public event shapes", () => {
       issueIdentifier: "TWO-1",
       url: "https://pc.example.com/TWO/issues/TWO-1",
       createdAt: "2026-10-31T11:00:00.000Z",
+      audience: "board",
+      interactionKind: "request_confirmation",
+      originKind: null,
+      originId: null,
     });
-    expect(Object.keys(event).sort()).toEqual(["createdAt", "id", "issueIdentifier", "kind", "url"]);
+    expect(Object.keys(event).sort()).toEqual([
+      "audience",
+      "createdAt",
+      "id",
+      "interactionKind",
+      "issueIdentifier",
+      "kind",
+      "originId",
+      "originKind",
+      "url",
+    ]);
+  });
+
+  it("toEvent normalizes a stored 0.2.0 entry missing the routing fields", () => {
+    const stored = {
+      kind: "approval",
+      id: "ap-1",
+      issueId: null,
+      issueIdentifier: null,
+      url: "/TWO/approvals/ap-1",
+      createdAt: "2026-10-31T12:00:00.000Z",
+    } as unknown as DecisionEvent;
+    expect(toEvent(stored)).toEqual({
+      kind: "approval",
+      id: "ap-1",
+      issueIdentifier: null,
+      url: "/TWO/approvals/ap-1",
+      createdAt: "2026-10-31T12:00:00.000Z",
+      // Fail-safe: a human looks, never "anyone".
+      audience: "board",
+      interactionKind: null,
+      originKind: null,
+      originId: null,
+    });
+  });
+
+  it("toEvent resets a stored audience outside the three known strings", () => {
+    const stored = {
+      kind: "interaction",
+      id: "ix-1",
+      issueId: "i-1",
+      issueIdentifier: "TWO-1",
+      url: "/TWO/issues/TWO-1",
+      createdAt: "2026-10-31T11:00:00.000Z",
+      audience: "everyone",
+      interactionKind: 7,
+      originKind: "plugin:board-council",
+      originId: 42,
+    } as unknown as DecisionEvent;
+    expect(toEvent(stored)).toEqual({
+      kind: "interaction",
+      id: "ix-1",
+      issueIdentifier: "TWO-1",
+      url: "/TWO/issues/TWO-1",
+      createdAt: "2026-10-31T11:00:00.000Z",
+      audience: "board",
+      interactionKind: null,
+      originKind: "plugin:board-council",
+      originId: null,
+    });
   });
 
   it("toRunFailureEvent drops the stored-only bookkeeping fields", () => {

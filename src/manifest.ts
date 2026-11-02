@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "togetherweown.decision-notifier";
-export const PLUGIN_VERSION = "0.2.0";
+export const PLUGIN_VERSION = "0.3.0";
 export const STREAM_CHANNEL = "decisions";
 export const SCAN_JOB_KEY = "decision-scan";
 
