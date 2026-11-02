@@ -244,8 +244,8 @@ export class DecisionNotifier {
   private readonly lastCatchUpScan = new Map<string, { at: number; config: string }>();
   /** When each company's failed runs were last reconciled. */
   private readonly lastRunReconcile = new Map<string, number>();
-  /** Companies with a reconciliation in flight; the throttle above is stamped only after a pass. */
-  private readonly reconciling = new Set<string>();
+  /** Each company's in-flight reconciliation; the throttle above is stamped only after a pass. */
+  private readonly reconciling = new Map<string, Promise<void>>();
   /** When each company's last event-triggered scan started; claimed up front, so it also guards reentry. */
   private readonly lastEventScanAt = new Map<string, number>();
   /** Companies whose job-context scope denial was already logged this session. */
@@ -524,17 +524,30 @@ export class DecisionNotifier {
    */
   async reconcileRunFailures(companyId: string): Promise<void> {
     // Events can arrive in bursts while a pass is still reading; the throttle
-    // below only takes effect once a pass finishes, so claim the company
-    // first (synchronously) and let overlapping callers skip.
-    if (this.reconciling.has(companyId)) return;
+    // below only takes effect once a pass finishes, so overlapping callers
+    // ride the in-flight pass instead of starting their own.
+    for (;;) {
+      const inFlight = this.reconciling.get(companyId);
+      if (!inFlight) break;
+      try {
+        await inFlight;
+        return;
+      } catch {
+        // That pass failed (for example, the scopeless job's calls were
+        // denied) without stamping the throttle: loop around and attempt a
+        // pass in this caller's context rather than treating the claim as a
+        // reconciliation.
+      }
+    }
     const now = Date.now();
     const last = this.lastRunReconcile.get(companyId);
     if (last !== undefined && now - last >= 0 && now - last < RUN_RECONCILE_INTERVAL_MS) return;
-    this.reconciling.add(companyId);
+    const pass = this.reconcileRunFailuresPass(companyId, now);
+    this.reconciling.set(companyId, pass);
     try {
-      await this.reconcileRunFailuresPass(companyId, now);
+      await pass;
     } finally {
-      this.reconciling.delete(companyId);
+      if (this.reconciling.get(companyId) === pass) this.reconciling.delete(companyId);
     }
   }
 

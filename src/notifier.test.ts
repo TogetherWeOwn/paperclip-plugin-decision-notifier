@@ -455,6 +455,35 @@ describe("event-triggered scans", () => {
     expect(cursorReads).toBe(1);
   });
 
+  it("retries reconciliation in the waiting caller's context when the in-flight pass fails", async () => {
+    const { harness, notifier } = setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    let cursorReads = 0;
+    const getState = harness.ctx.state.get.bind(harness.ctx.state);
+    harness.ctx.state.get = async (key) => {
+      if (key.stateKey === "run-failure-cursor") cursorReads++;
+      return getState(key);
+    };
+    // The first pass (say, the scopeless job's) is denied after a delay; the
+    // next caller's context is admitted.
+    const getConfig = harness.ctx.config.get.bind(harness.ctx.config);
+    let first = true;
+    harness.ctx.config.get = async (...args) => {
+      if (first) {
+        first = false;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+      }
+      return getConfig(...args);
+    };
+
+    const denied = notifier.reconcileRunFailures(COMPANY).catch(() => {});
+    const admitted = notifier.reconcileRunFailures(COMPANY);
+    await Promise.all([denied, admitted]);
+
+    expect(cursorReads).toBe(1);
+  });
+
   it("ignores a missing company id", async () => {
     const { harness, notifier } = setup();
     await notifier.scanFromEventIfDue(null);
