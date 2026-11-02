@@ -126,7 +126,10 @@ const RUN_PAGE_LIMIT = 100;
  * whose scope outlives the handler) is still active. In a busy instance that
  * is effectively always, so the scan works from the companies it has been
  * invoked for and treats the list as an occasional refresh, never a
- * requirement.
+ * requirement — and once a refresh is scope-denied it is not retried by this
+ * worker at all (see companyListScopeDenied): measured in production, every
+ * refresh was denied while per-company job scans ran fine, so each retry
+ * only repeated an error line in the host log.
  */
 export const COMPANY_LIST_REFRESH_MS = 15 * 60_000;
 /**
@@ -268,6 +271,18 @@ export class DecisionNotifier {
   private knownCompaniesQueue: Promise<unknown> = Promise.resolve();
   /** The last `companies.list` attempt (success or failure) by this worker. */
   private lastCompanyListAttempt: number | null = null;
+  /**
+   * Whether `companies.list` has been scope-denied to this worker. The denial
+   * can in principle clear in a fully idle window (no scoped invocation
+   * active), but while an instance has any event traffic the window never
+   * comes, and the host logs an error for every denied retry. New companies
+   * are still learned without the list — every company-scoped entry point
+   * notes its company, including `company.created` — so the refresh is
+   * latched off for the session instead of being repeated in vain. A worker
+   * restart re-probes once. Non-scope failures do not latch (see
+   * COMPANY_LIST_REFRESH_MS).
+   */
+  private companyListScopeDenied = false;
 
   constructor(private readonly ctx: PluginContext) {}
 
@@ -377,12 +392,13 @@ export class DecisionNotifier {
    * companies must never fail the job while its per-company calls still work.
    * The refresh is skipped while the host has denied the job every known
    * company (see jobScopeDenied): discovering more companies cannot give the
-   * job anything it may scan, and a denied refresh only repeats the host's
-   * error log. It resumes when an event notes a company the job has not been
-   * denied — and new companies are learned from events either way.
+   * job anything it may scan. Once the list call itself is scope-denied it is
+   * not attempted again by this worker (see companyListScopeDenied); new
+   * companies are learned from events either way.
    */
   private companiesToScan(): Promise<string[]> {
     return this.withKnownCompanies(async (known, loaded) => {
+      if (this.companyListScopeDenied) return [...known];
       if (known.size > 0 && [...known].every((id) => this.jobScopeDenied.has(id))) return [...known];
       const now = Date.now();
       const sinceAttempt = this.lastCompanyListAttempt === null ? null : now - this.lastCompanyListAttempt;
@@ -393,10 +409,18 @@ export class DecisionNotifier {
       try {
         listed = new Set((await this.ctx.companies.list()).map((company) => company.id).filter(Boolean));
       } catch (err) {
-        this.ctx.logger.warn("company list unavailable; scanning known companies", {
-          error: String(err),
-          knownCompanies: known.size,
-        });
+        if (isInvocationScopeDenial(err)) {
+          this.companyListScopeDenied = true;
+          this.ctx.logger.warn(
+            "company list unavailable from job context; scanning known companies until worker restart",
+            { error: String(err), knownCompanies: known.size },
+          );
+        } else {
+          this.ctx.logger.warn("company list unavailable; scanning known companies", {
+            error: String(err),
+            knownCompanies: known.size,
+          });
+        }
         return [...known];
       }
       // An empty list would silently stop every scan; it is only believable
