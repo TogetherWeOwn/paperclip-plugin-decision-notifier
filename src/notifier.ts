@@ -129,6 +129,19 @@ const RUN_PAGE_LIMIT = 100;
  * requirement.
  */
 export const COMPANY_LIST_REFRESH_MS = 15 * 60_000;
+/**
+ * How often an event may trigger a full scan of its company. The scheduled
+ * job runs without a company invocation scope, and hosts that gate worker
+ * calls by invocation scope admit its per-company calls only for companies
+ * authorized for proactive work — seeded from per-company plugin config,
+ * which this plugin does not have (its config is instance-scoped), so in
+ * practice the set can be empty and every per-company call from the job is
+ * denied while any scoped invocation is active. Running the same scan from
+ * inside a company-scoped event invocation, where every call is admitted,
+ * keeps the periodic reconciliation working either way; the job remains a
+ * fallback for hosts that do authorize it.
+ */
+export const EVENT_SCAN_INTERVAL_MS = 60_000;
 /** A failed read of the remembered company set is retried at most this often. */
 const KNOWN_COMPANIES_LOAD_RETRY_MS = 60_000;
 /** Group id of the item that collects a window's distinct failures past the cap. */
@@ -204,6 +217,12 @@ function samePending(a: PendingMap, b: PendingMap): boolean {
   return keys.every((key) => b[key] !== undefined && JSON.stringify(a[key]) === JSON.stringify(b[key]));
 }
 
+/** A host refusal because the call was made without (or outside) a company invocation scope. */
+export function isInvocationScopeDenial(err: unknown): boolean {
+  const message = String(err);
+  return message.includes("invocation scope") || message.includes("company context is required");
+}
+
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);
   let next = 0;
@@ -225,6 +244,10 @@ export class DecisionNotifier {
   private readonly lastCatchUpScan = new Map<string, { at: number; config: string }>();
   /** When each company's failed runs were last reconciled. */
   private readonly lastRunReconcile = new Map<string, number>();
+  /** When each company's last event-triggered scan started; claimed up front, so it also guards reentry. */
+  private readonly lastEventScanAt = new Map<string, number>();
+  /** Companies whose job-context scope denial was already logged this session. */
+  private readonly jobScopeDenialLogged = new Set<string>();
   /** Companies remembered in state, once a read of it has succeeded. */
   private knownCompanies: Set<string> | null = null;
   /** Companies noted before the remembered set could be read; merged into it on the first good read. */
@@ -243,17 +266,68 @@ export class DecisionNotifier {
   /** Reconcile every known company. One failing company, or one failing part, does not stop the others. */
   async scanAll(): Promise<void> {
     for (const companyId of await this.companiesToScan()) {
-      try {
-        await this.scanCompany(companyId);
-      } catch (err) {
-        this.ctx.logger.error("decision scan failed", { companyId, error: String(err) });
-      }
-      try {
-        await this.reconcileRunFailures(companyId);
-      } catch (err) {
-        this.ctx.logger.error("run failure reconciliation failed", { companyId, error: String(err) });
-      }
+      await this.scanAndReconcile(companyId, "job");
     }
+  }
+
+  /**
+   * Periodic-scan entry point for company-scoped invocations (events): runs
+   * a full scan of the company at most once per EVENT_SCAN_INTERVAL_MS, from
+   * inside the invocation whose scope admits the scan's calls (see that
+   * constant for why the job cannot be relied on to do this). Never throws:
+   * a scan failure must not fail the event that triggered it.
+   *
+   * `reconcile: false` skips failed-run reconciliation: a run-failure event
+   * must not reconcile the runs it just reported, because reading them back
+   * that early can advance the reconciliation cursor before a run's error
+   * text becomes readable. Other events (and the job) keep its cadence.
+   */
+  async scanFromEventIfDue(
+    companyId: string | null | undefined,
+    options: { reconcile?: boolean } = {},
+  ): Promise<void> {
+    if (!companyId) return;
+    const now = Date.now();
+    const last = this.lastEventScanAt.get(companyId);
+    if (last !== undefined && now - last >= 0 && now - last < EVENT_SCAN_INTERVAL_MS) return;
+    // Claim the slot before scanning, so events landing mid-scan do not pile up a second one.
+    this.lastEventScanAt.set(companyId, now);
+    await this.scanAndReconcile(companyId, "event", options.reconcile !== false);
+  }
+
+  /** Scan one company and reconcile its failed runs, logging either part's failure without throwing. */
+  private async scanAndReconcile(companyId: string, source: "job" | "event", reconcile = true): Promise<void> {
+    try {
+      const pending = await this.scanCompany(companyId);
+      this.ctx.logger.info("decision scan completed", { companyId, source, pending: pending.length });
+    } catch (err) {
+      this.logScanFailure("decision scan failed", companyId, source, err);
+    }
+    if (!reconcile) return;
+    try {
+      await this.reconcileRunFailures(companyId);
+    } catch (err) {
+      this.logScanFailure("run failure reconciliation failed", companyId, source, err);
+    }
+  }
+
+  /**
+   * A scope denial from the job context is the host working as configured
+   * (see EVENT_SCAN_INTERVAL_MS), not a scan error: warn once per company
+   * per session instead of logging an error every minute for a scan the
+   * event path is already covering.
+   */
+  private logScanFailure(message: string, companyId: string, source: "job" | "event", err: unknown): void {
+    if (source === "job" && isInvocationScopeDenial(err)) {
+      if (this.jobScopeDenialLogged.has(companyId)) return;
+      this.jobScopeDenialLogged.add(companyId);
+      this.ctx.logger.warn("scan unavailable from job context; relying on event-driven scans", {
+        companyId,
+        error: String(err),
+      });
+      return;
+    }
+    this.ctx.logger.error(message, { companyId, error: String(err) });
   }
 
   /**

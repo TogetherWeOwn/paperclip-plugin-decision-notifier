@@ -365,7 +365,9 @@ describe("catch-up", () => {
   });
 
   it("rescans at most once per window when catch-up is called in a loop", async () => {
-    const { harness, ids } = await setup();
+    // Run-failure reconciliation also lists issues; disable it so the counts
+    // below measure decision scans only.
+    const { harness, ids } = await setup({ runFailures: { enabled: false } });
     harness.seed({ issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>)] });
     let lists = 0;
     const list = harness.ctx.issues.list.bind(harness.ctx.issues);
@@ -384,15 +386,17 @@ describe("catch-up", () => {
       }
       expect(ids()).toEqual(["owner_card:i-1", "owner_card:i-1", "owner_card:i-1"]);
       // Events keep the reused set current: a decision raised in the window is replayed.
+      // The event also carries a throttled full scan (the second scansPerCall);
+      // the catch-up itself still adds no rescan in the window.
       harness.seed({ approvals: [approval("ap-1")] });
       await harness.emit("approval.created", {}, { companyId: COMPANY, entityId: "ap-1" });
       const inWindow = await catchUp();
-      expect(lists).toBe(scansPerCall);
+      expect(lists).toBe(2 * scansPerCall);
       expect((inWindow.body as { pending: DecisionEvent[] }).pending.map((e) => e.id).sort()).toEqual(["ap-1", "i-1"]);
 
       vi.advanceTimersByTime(CATCH_UP_RESCAN_MS);
       await catchUp();
-      expect(lists).toBe(2 * scansPerCall);
+      expect(lists).toBe(3 * scansPerCall);
     } finally {
       vi.useRealTimers();
     }
@@ -680,7 +684,9 @@ describe("error handling", () => {
     await expect(harness.emit("approval.created", {}, { companyId: COMPANY, entityId: "ap-1" })).rejects.toThrow("transient");
     await harness.emit("approval.created", {}, { companyId: COMPANY, entityId: "ap-2" });
 
-    expect(ids()).toEqual(["approval:ap-2"]);
+    // The company is not wedged by the earlier throw — and the scan the second
+    // event carries reconciles in ap-1, whose own handler was the one that threw.
+    expect(ids()).toEqual(["approval:ap-2", "approval:ap-1"]);
   });
 
 });
@@ -712,7 +718,9 @@ describe("issue events", () => {
       issueInteractions: [interaction("ix-1", "i-1")],
     });
     await harness.runJob(SCAN_JOB_KEY);
+    // The card is gone: neither a point read nor the scan the event carries sees it.
     harness.ctx.issues.get = async () => null;
+    harness.ctx.issues.list = async () => [];
     await harness.emit("issue.updated", {}, { companyId: COMPANY, entityId: "i-1" });
     expect(harness.getState({ scopeKind: "company", scopeId: COMPANY, stateKey: "pending" })).toEqual({});
   });

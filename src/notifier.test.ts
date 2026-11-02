@@ -4,6 +4,7 @@ import manifest from "./manifest.js";
 import {
   COMPANY_LIST_REFRESH_MS,
   DecisionNotifier,
+  EVENT_SCAN_INTERVAL_MS,
   INTERACTION_ISSUE_STATUSES,
   OPEN_ISSUE_STATUSES,
   toEvent,
@@ -367,6 +368,78 @@ describe("scanAll error isolation", () => {
       message: "run failure reconciliation failed",
       meta: { companyId: COMPANY, error: "Error: state down" },
     });
+  });
+});
+
+describe("event-triggered scans", () => {
+  it("scans on the first event, throttles within the interval, and scans again after it", async () => {
+    const { harness, emitted, notifier } = setup();
+    harness.seed({ approvals: [approval("ap-1")] });
+    const start = Date.now();
+    let now = start;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      await notifier.scanFromEventIfDue(COMPANY);
+      harness.seed({ approvals: [approval("ap-1"), approval("ap-2")] });
+      now = start + EVENT_SCAN_INTERVAL_MS - 1;
+      await notifier.scanFromEventIfDue(COMPANY); // throttled: ap-2 not yet found
+      now = start + EVENT_SCAN_INTERVAL_MS;
+      await notifier.scanFromEventIfDue(COMPANY);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(emitted.map((e) => e.id)).toEqual(["ap-1", "ap-2"]);
+    expect(
+      harness.logs.filter((log) => log.message === "decision scan completed"),
+    ).toEqual([
+      { level: "info", message: "decision scan completed", meta: { companyId: COMPANY, source: "event", pending: 1 } },
+      { level: "info", message: "decision scan completed", meta: { companyId: COMPANY, source: "event", pending: 2 } },
+    ]);
+  });
+
+  it("logs a failed event-triggered scan instead of throwing into the event handler", async () => {
+    const { harness, notifier } = setup();
+    harness.ctx.config.get = async () => {
+      throw new Error("config down");
+    };
+
+    await expect(notifier.scanFromEventIfDue(COMPANY)).resolves.toBeUndefined();
+
+    expect(harness.logs).toContainEqual({
+      level: "error",
+      message: "decision scan failed",
+      meta: { companyId: COMPANY, error: "Error: config down" },
+    });
+  });
+
+  it("ignores a missing company id", async () => {
+    const { harness, notifier } = setup();
+    await notifier.scanFromEventIfDue(null);
+    await notifier.scanFromEventIfDue(undefined);
+    expect(harness.logs.filter((log) => log.message === "decision scan completed")).toEqual([]);
+  });
+});
+
+describe("job-context scope denials", () => {
+  it("warns once per company instead of erroring every run when the host denies the job's calls", async () => {
+    const { harness, notifier } = setup();
+    harness.ctx.config.get = async () => {
+      throw new Error(
+        'Plugin "p" is not allowed to perform "config.get": the worker referenced a missing, expired, or unknown invocation scope',
+      );
+    };
+
+    await notifier.scanAll();
+    await notifier.scanAll();
+
+    const warnings = harness.logs.filter(
+      (log) => log.message === "scan unavailable from job context; relying on event-driven scans",
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].level).toBe("warn");
+    expect(warnings[0].meta?.companyId).toBe(COMPANY);
+    expect(harness.logs.filter((log) => log.level === "error")).toEqual([]);
   });
 });
 

@@ -4,6 +4,10 @@
 
 (nothing yet)
 
+## 0.3.2
+
+- Fixed the periodic scan still not running after 0.3.1 on hosts that gate worker calls by invocation scope. 0.3.1 removed the scan's dependence on the wildcard `companies.list`, but a scopeless job's per-company calls are admitted only for companies the host has authorized for proactive work — a set the host seeds from per-company plugin config. This plugin's config is instance-scoped, so that set can be empty, and then every per-company call from the job is denied ("missing, expired, or unknown invocation scope") while any event invocation is active; the job merely *looked* successful because per-company failures are caught. The scan now also runs from inside company-scoped event invocations, throttled to once a minute per company, where all of its calls are admitted. The job remains as a fallback for hosts that authorize it, logs one warning per company when the host denies it instead of an error every minute, and every completed scan logs `decision scan completed` with its source (`job` or `event`) and pending count. Event, catch-up and stream behavior is otherwise unchanged.
+
 ## 0.3.1
 
 - Fixed the `decision-scan` job failing with "the worker referenced a missing, expired, or unknown invocation scope" on hosts that gate worker calls by invocation scope. A scheduled job runs scopeless, and the scan's first call, `companies.list`, is a wildcard call such hosts never grant to a scopeless caller while any scoped invocation (for example, an event delivery, whose scope outlives its handler) is still active — in a busy instance, effectively always. The scan now works from the companies the plugin has been invoked for (events, the catch-up route, and a new `company.created` subscription), persisted in instance-scoped state, and re-reads the full company list only as a refresh at most every 15 minutes, falling back to the remembered set when the list call is denied. Event, catch-up and stream behavior is unchanged.
