@@ -4,6 +4,10 @@
 
 (nothing yet)
 
+## 0.3.4
+
+- Fixed the last recurring denied call left after 0.3.3: the 15-minute `companies.list` discovery refresh, which the host still denied — and logged as a "host handler error" — at every retry whenever any event invocation was active, even once per-company job scans were running fine. 0.3.3 deliberately kept the retry because a wildcard denial can lift in a fully idle window, but in a busy instance that window never comes: measured in production, every refresh was denied while the job scanned successfully each minute. A scope-denied refresh is now latched off for the worker session after one warning (a restart re-probes once); non-scope list failures keep the 15-minute retry. New companies are still learned without the list, from every company-scoped entry point including `company.created`.
+
 ## 0.3.3
 
 - Fixed the `decision-scan` job still making the host log a "host handler error" every minute after 0.3.2 on hosts that deny its calls. 0.3.2 made the event-driven scan do the periodic work and quieted the plugin's own logging to one warning per company, but the job kept *attempting* the denied per-company calls (and the wildcard `companies.list` refresh), and the host logs an error for each denied call the plugin makes. The scopes a scopeless job may act under are fixed when the worker loads, so a per-company scope denial cannot clear mid-session: the job now latches a company's denial for the session and makes no further calls for it, while event-driven scans are unaffected and a worker restart re-probes. The company-list refresh keeps its retry cadence while the job can scan at least one known company (a wildcard denial is transient), and is skipped only once every known company is latched — discovering more companies cannot give the job anything it may scan, and new companies are learned from events either way.

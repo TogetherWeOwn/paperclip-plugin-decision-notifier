@@ -587,7 +587,7 @@ describe("scanAll company enumeration", () => {
     expect(emitted.map((e) => e.id)).toEqual(["ap-1", "ap-2"]);
     expect(harness.logs).toContainEqual({
       level: "warn",
-      message: "company list unavailable; scanning known companies",
+      message: "company list unavailable from job context; scanning known companies until worker restart",
       meta: {
         error: "Error: the worker referenced a missing, expired, or unknown invocation scope",
         knownCompanies: 1,
@@ -665,8 +665,8 @@ describe("scanAll company enumeration", () => {
     expect(configCalls).toBe(1);
   });
 
-  it("keeps retrying a scope-denied company list while the job can still scan a known company", async () => {
-    const { harness, notifier } = setup();
+  it("latches a scope-denied company list for the session, even while the job can scan", async () => {
+    const { harness, emitted, notifier } = setup();
     let calls = 0;
     harness.ctx.companies.list = async () => {
       calls++;
@@ -674,16 +674,31 @@ describe("scanAll company enumeration", () => {
     };
 
     await notifier.noteCompany(COMPANY); // per-company calls are admitted in this harness
-    await notifier.scanAll();
-    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + COMPANY_LIST_REFRESH_MS + 1);
+    harness.seed({ approvals: [approval("ap-1")] });
+    await notifier.scanAll(); // list denied: latched off, but the known company still scans
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2 * COMPANY_LIST_REFRESH_MS + 1);
     try {
+      harness.seed({ approvals: [approval("ap-1"), approval("ap-2")] });
       await notifier.scanAll();
     } finally {
       now.mockRestore();
     }
 
-    // A wildcard denial is transient (it lifts when no scoped invocation is
-    // active), so a job that can scan keeps its discovery refresh.
+    // The host logs an error for every denied call, and in a busy instance
+    // the wildcard denial never lifts (a scoped invocation is always
+    // active), so the refresh is not repeated; new companies still arrive
+    // from events. Job scans themselves carry on unaffected.
+    expect(calls).toBe(1);
+    expect(emitted.map((e) => e.id)).toEqual(["ap-1", "ap-2"]);
+    expect(
+      harness.logs.filter(
+        (log) => log.message === "company list unavailable from job context; scanning known companies until worker restart",
+      ),
+    ).toHaveLength(1);
+
+    // A new notifier on the same store (worker restart) re-probes once.
+    const restarted = new DecisionNotifier(harness.ctx);
+    await restarted.scanAll();
     expect(calls).toBe(2);
   });
 
