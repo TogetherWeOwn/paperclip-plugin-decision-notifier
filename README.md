@@ -6,9 +6,9 @@ A decision is one of:
 
 | kind | pending when | source |
 |---|---|---|
-| `approval` | approval status is `pending` | `approval.created` / `approval.decided` events, plus the scan job |
-| `interaction` | a thread interaction (decision card) is `pending`, not addressed to an agent, on a card that is not done or cancelled | the scan job, and `issue.created` / `issue.updated` events for that card |
-| `owner_card` | an open card (`todo`, `in_progress`, `in_review`, `blocked`) is assigned to an owner user | `issue.created` / `issue.updated` events, plus the scan job |
+| `approval` | approval status is `pending` | `approval.created` / `approval.decided` events, plus the periodic scan |
+| `interaction` | a thread interaction (decision card) is `pending`, not addressed to an agent, on a card that is not done or cancelled | the periodic scan, and `issue.created` / `issue.updated` events for that card |
+| `owner_card` | an open card (`todo`, `in_progress`, `in_review`, `blocked`) is assigned to an owner user | `issue.created` / `issue.updated` events, plus the periodic scan |
 
 Agent-addressed interactions are left out on purpose: Paperclip already wakes that agent.
 
@@ -16,13 +16,13 @@ The stream also carries one non-decision kind:
 
 | kind | pending when | source |
 |---|---|---|
-| `run_failure` | an agent run ended `failed` or `timed_out` in the last 24 hours | `agent.run.failed` events, plus a reconciliation in the scan job every 5 minutes |
+| `run_failure` | an agent run ended `failed` or `timed_out` in the last 24 hours | `agent.run.failed` events, plus a reconciliation alongside the periodic scan every 5 minutes |
 
 Failures are grouped: one item per normalised error signature and fixed window (30 minutes by default), across agents. Retries that hit the same error, such as an adapter rejecting the configured model three times before Paperclip's bounded retry blocks the card, become one item with a `count`, not three, and an outage that fails runs on many agents at once is one item listing those agents. A company gets at most 5 new items per window; further distinct failures in that window share one overflow item. Cancelled runs are never announced: someone chose to stop them.
 
-Thread interactions are not plugin events in Paperclip 2026.1023.0. Until [paperclipai/paperclip#4990](https://github.com/paperclipai/paperclip/pull/4990) ships, a scan job (`* * * * *`) finds them, so a new interaction reaches the stream within about a minute. Approvals and owner cards arrive as soon as Paperclip delivers the event.
+Thread interactions are not plugin events in Paperclip 2026.1023.0. Until [paperclipai/paperclip#4990](https://github.com/paperclipai/paperclip/pull/4990) ships, a periodic scan finds them, so a new interaction in an active company reaches the stream within about a minute. Approvals and owner cards arrive as soon as Paperclip delivers the event.
 
-The scan covers the companies the plugin has been invoked for — via events, `company.created`, or the catch-up route — remembered in plugin state, with the full company list re-read as a refresh at most every 15 minutes when the host allows it. A scheduled job runs without a company invocation scope, and listing all companies is exactly the call such a caller may not be granted, so the scan never depends on it.
+The scan runs two ways. A scheduled job (`* * * * *`) sweeps every company the plugin has been invoked for — via events, `company.created`, or the catch-up route — remembered in plugin state, with the full company list re-read as a refresh at most every 15 minutes when the host allows it. But a scheduled job runs without a company invocation scope, and hosts that gate worker calls by invocation scope may deny some or all of its calls (listing all companies, and per-company calls for companies not authorized for proactive work), so the scan never depends on the job alone: each company-scoped event also carries the same scan for its company, throttled to once a minute, from inside the invocation whose scope admits those calls. One consequence: on a host that denies the job, a company with no events at all is not scanned until something in it stirs or a client calls catch-up — there is no scoped invocation to scan from, and usually nothing new to find either.
 
 ## Events
 
@@ -70,7 +70,7 @@ POST /api/plugins/togetherweown.decision-notifier/api/catch-up   {"companyId":"<
 
 Both need a board credential (a board API key or browser session). The stream is Server-Sent Events. Decisions are the plain `data:` frames. Ignore `event: open`. On `event: close` the plugin worker has stopped and Paperclip leaves the response open with nothing behind it: disconnect, reconnect, and call catch-up again. The wait client exits 1 on `close` so its caller re-arms.
 
-Paperclip does not tell a plugin when a client connects, so catch-up is an explicit call: open the stream, wait for the server's `:ok` comment, then `POST /catch-up`. The plugin rescans, replays every pending decision and every run failure group still in its 24-hour retention onto the stream, and also returns them as `{"pending":[…]}`. Subscribing first means nothing falls between the replay and live events. Catch-up calls for a company within 10 s of its last catch-up scan, with the same config and issue prefix, replay the stored set instead of rescanning, so a client calling in a loop costs one scan per 10 s. Approval and card events keep that set current. Thread interactions have no event: one raised since the last scan is missing from such a replay until the next scan job announces it on the stream, within about a minute. A polling client sees it on its next catch-up outside the window.
+Paperclip does not tell a plugin when a client connects, so catch-up is an explicit call: open the stream, wait for the server's `:ok` comment, then `POST /catch-up`. The plugin rescans, replays every pending decision and every run failure group still in its 24-hour retention onto the stream, and also returns them as `{"pending":[…]}`. Subscribing first means nothing falls between the replay and live events. Catch-up calls for a company within 10 s of its last catch-up scan, with the same config and issue prefix, replay the stored set instead of rescanning, so a client calling in a loop costs one scan per 10 s. Approval and card events keep that set current. Thread interactions have no event: one raised since the last scan is missing from such a replay until the next scan announces it on the stream — within about a minute while the company is active. A polling client sees it on its next catch-up outside the window.
 
 ### `paperclip-decision-wait`
 
@@ -108,7 +108,7 @@ paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-deci
 ## Limits
 
 - Private cards the plugin cannot read are not scanned.
-- The scan reads interactions for every card that is not done or cancelled (including `backlog`) each minute. That is fine for hundreds of such cards; it is temporary until #4990 lets the plugin subscribe instead.
+- The scan reads interactions for every card that is not done or cancelled (including `backlog`) about each minute while the company is active. That is fine for hundreds of such cards; it is temporary until #4990 lets the plugin subscribe instead.
 - Card lists are read without `limit`/`offset`: in Paperclip 2026.1023.0 the host applies `offset` twice for plugin issue lists, so paging past the first page returns nothing.
 - Run failure reconciliation reads the runs of open cards assigned to an agent (`ctx.issues.summaries.getOrchestration`, up to 100 runs per card), at most once every 5 minutes per company, from a cursor stored in `plugin.state`. The plugin SDK has no company-wide run list, so a dropped `agent.run.failed` event for a run with no card, or whose card is already done, cancelled or assigned to a user, is not recovered. The cursor only advances after a pass in which every read succeeded. On first start it looks back one window.
 - Runs beyond the first 100 on a card are not read (`getOrchestration` takes no paging parameter). A dropped `agent.run.failed` event for such a run is not recovered; the plugin logs a `run page full` warning when a card returns a full page.

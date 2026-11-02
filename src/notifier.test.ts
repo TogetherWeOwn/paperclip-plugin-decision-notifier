@@ -4,6 +4,7 @@ import manifest from "./manifest.js";
 import {
   COMPANY_LIST_REFRESH_MS,
   DecisionNotifier,
+  EVENT_SCAN_INTERVAL_MS,
   INTERACTION_ISSUE_STATUSES,
   OPEN_ISSUE_STATUSES,
   toEvent,
@@ -367,6 +368,149 @@ describe("scanAll error isolation", () => {
       message: "run failure reconciliation failed",
       meta: { companyId: COMPANY, error: "Error: state down" },
     });
+  });
+});
+
+describe("event-triggered scans", () => {
+  it("scans on the first event, throttles within the interval, and scans again after it", async () => {
+    const { harness, emitted, notifier } = setup();
+    harness.seed({ approvals: [approval("ap-1")] });
+    const start = Date.now();
+    let now = start;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      await notifier.scanFromEventIfDue(COMPANY);
+      harness.seed({ approvals: [approval("ap-1"), approval("ap-2")] });
+      now = start + EVENT_SCAN_INTERVAL_MS - 1;
+      await notifier.scanFromEventIfDue(COMPANY); // throttled: ap-2 not yet found
+      now = start + EVENT_SCAN_INTERVAL_MS;
+      await notifier.scanFromEventIfDue(COMPANY);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(emitted.map((e) => e.id)).toEqual(["ap-1", "ap-2"]);
+    expect(
+      harness.logs.filter((log) => log.message === "decision scan completed"),
+    ).toEqual([
+      { level: "info", message: "decision scan completed", meta: { companyId: COMPANY, source: "event", pending: 1 } },
+      { level: "info", message: "decision scan completed", meta: { companyId: COMPANY, source: "event", pending: 2 } },
+    ]);
+  });
+
+  it("logs a failed event-triggered scan instead of throwing into the event handler", async () => {
+    const { harness, notifier } = setup();
+    harness.ctx.config.get = async () => {
+      throw new Error("config down");
+    };
+
+    await expect(notifier.scanFromEventIfDue(COMPANY)).resolves.toBeUndefined();
+
+    expect(harness.logs).toContainEqual({
+      level: "error",
+      message: "decision scan failed",
+      meta: { companyId: COMPANY, error: "Error: config down" },
+    });
+  });
+
+  it("still reconciles on a later event when a run-failure event claimed the scan slot without reconciling", async () => {
+    const { harness, notifier } = setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    let cursorReads = 0;
+    const get = harness.ctx.state.get.bind(harness.ctx.state);
+    harness.ctx.state.get = async (key) => {
+      if (key.stateKey === "run-failure-cursor") cursorReads++;
+      return get(key);
+    };
+
+    // A run-failure event claims the slot for a decision-only scan...
+    await notifier.scanFromEventIfDue(COMPANY, { reconcile: false });
+    expect(cursorReads).toBe(0);
+    // ...and an event inside the scan interval must still get its reconciliation.
+    await notifier.scanFromEventIfDue(COMPANY);
+
+    expect(cursorReads).toBe(1);
+    expect(harness.logs.filter((log) => log.message === "decision scan completed")).toHaveLength(1);
+  });
+
+  it("does not start a second reconciliation while one is in flight", async () => {
+    const { harness, notifier } = setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    let cursorReads = 0;
+    const get = harness.ctx.state.get.bind(harness.ctx.state);
+    harness.ctx.state.get = async (key) => {
+      if (key.stateKey === "run-failure-cursor") {
+        cursorReads++;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      return get(key);
+    };
+
+    // The throttle is stamped only after a successful pass, so without an
+    // in-flight guard every event in a burst would start its own pass.
+    const first = notifier.reconcileRunFailures(COMPANY);
+    const second = notifier.reconcileRunFailures(COMPANY);
+    await Promise.all([first, second]);
+
+    expect(cursorReads).toBe(1);
+  });
+
+  it("retries reconciliation in the waiting caller's context when the in-flight pass fails", async () => {
+    const { harness, notifier } = setup();
+    harness.seed({ issues: [issue("i-1", "TWO-1")] });
+    let cursorReads = 0;
+    const getState = harness.ctx.state.get.bind(harness.ctx.state);
+    harness.ctx.state.get = async (key) => {
+      if (key.stateKey === "run-failure-cursor") cursorReads++;
+      return getState(key);
+    };
+    // The first pass (say, the scopeless job's) is denied after a delay; the
+    // next caller's context is admitted.
+    const getConfig = harness.ctx.config.get.bind(harness.ctx.config);
+    let first = true;
+    harness.ctx.config.get = async (...args) => {
+      if (first) {
+        first = false;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        throw new Error("the worker referenced a missing, expired, or unknown invocation scope");
+      }
+      return getConfig(...args);
+    };
+
+    const denied = notifier.reconcileRunFailures(COMPANY).catch(() => {});
+    const admitted = notifier.reconcileRunFailures(COMPANY);
+    await Promise.all([denied, admitted]);
+
+    expect(cursorReads).toBe(1);
+  });
+
+  it("ignores a missing company id", async () => {
+    const { harness, notifier } = setup();
+    await notifier.scanFromEventIfDue(null);
+    await notifier.scanFromEventIfDue(undefined);
+    expect(harness.logs.filter((log) => log.message === "decision scan completed")).toEqual([]);
+  });
+});
+
+describe("job-context scope denials", () => {
+  it("warns once per company instead of erroring every run when the host denies the job's calls", async () => {
+    const { harness, notifier } = setup();
+    harness.ctx.config.get = async () => {
+      throw new Error(
+        'Plugin "p" is not allowed to perform "config.get": the worker referenced a missing, expired, or unknown invocation scope',
+      );
+    };
+
+    await notifier.scanAll();
+    await notifier.scanAll();
+
+    const warnings = harness.logs.filter(
+      (log) => log.message === "scan unavailable from job context; relying on event-driven scans",
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].level).toBe("warn");
+    expect(warnings[0].meta?.companyId).toBe(COMPANY);
+    expect(harness.logs.filter((log) => log.level === "error")).toEqual([]);
   });
 });
 

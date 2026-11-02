@@ -14,22 +14,28 @@ const plugin = definePlugin({
       await current.scanAll();
     });
 
-    // Events give low latency; the scan job is the safety net and the only
-    // source for thread interactions until they become plugin events (#4990).
+    // Events give low latency, and each one also carries the periodic scan
+    // (throttled per company): the scan job runs scopeless, so hosts that
+    // gate by invocation scope may deny its per-company calls, while an
+    // event's company scope admits them. The full scan is the only source
+    // for thread interactions until they become plugin events (#4990).
     for (const name of ["approval.created", "approval.decided"] as const) {
       ctx.events.on(name, async (event) => {
         await current.onApprovalEvent(event.companyId, event.entityId);
+        await current.scanFromEventIfDue(event.companyId);
       });
     }
     for (const name of ["issue.created", "issue.updated"] as const) {
       ctx.events.on(name, async (event) => {
         await current.onIssueEvent(event.companyId, event.entityId);
+        await current.scanFromEventIfDue(event.companyId);
       });
     }
     // Failed and timed-out runs. Cancelled runs have their own event, which is
-    // deliberately not subscribed. The scan job reconciles dropped events.
+    // deliberately not subscribed. The scan reconciles dropped events.
     ctx.events.on("agent.run.failed", async (event) => {
       await current.onRunFailedEvent(event.companyId, event.payload, event.occurredAt, event.entityId);
+      await current.scanFromEventIfDue(event.companyId, { reconcile: false });
     });
     // The scan job covers the companies the plugin has been invoked for; a
     // company created after startup joins that set here, before it necessarily
