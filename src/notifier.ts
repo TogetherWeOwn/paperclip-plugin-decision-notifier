@@ -868,9 +868,13 @@ export class DecisionNotifier {
   }
 
   /**
-   * Replace the stored set with `build(stored)` and emit the decisions it adds.
-   * Fields are refreshed from the latest read (URL config may have changed);
-   * only the first-seen createdAt is kept. Call with the company lock held.
+   * Replace the stored set with `build(stored)` and emit the decisions it adds,
+   * plus any whose audience is reclassified (addressee or `ownerUserIds`
+   * changed, or the derivation changed across an upgrade). Fields are refreshed
+   * from the latest read (URL config may have changed); only the first-seen
+   * createdAt is kept, so a re-announced decision keeps its dedupe key and only
+   * wakes consumers that skipped the old audience without marking it seen.
+   * Call with the company lock held.
    */
   private async commit(
     companyId: string,
@@ -883,7 +887,10 @@ export class DecisionNotifier {
     for (const [key, decision] of Object.entries(build(stored))) {
       const previous = stored[key];
       next[key] = previous ? { ...decision, createdAt: previous.createdAt } : decision;
-      if (!previous) fresh.push(decision);
+      // Compare against the normalized previous event: a stored entry from
+      // before routing fields existed reads as "board", so an unchanged
+      // approval is not re-announced just because its raw audience is absent.
+      if (!previous || toEvent(previous).audience !== decision.audience) fresh.push(next[key]);
     }
     if (!samePending(next, stored)) await this.save(companyId, next);
     if (emitNew) for (const decision of fresh) this.emit(companyId, decision);

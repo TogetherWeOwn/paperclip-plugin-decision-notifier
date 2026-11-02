@@ -599,6 +599,51 @@ describe("routing fields", () => {
     await harness.runJob(SCAN_JOB_KEY);
     expect(emitted).toHaveLength(1);
   });
+
+  it("re-announces a pending interaction whose audience is reclassified, once, with its first-seen createdAt", async () => {
+    const { harness, emitted } = await setup({ ownerUserIds: [OWNER] });
+    // A pending set written before the operator split: an operator-addressed
+    // interaction stored as "owner", as every addressed interaction used to be.
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: COMPANY, stateKey: "pending" },
+      {
+        "interaction:ix-1": {
+          kind: "interaction",
+          id: "ix-1",
+          issueId: "i-1",
+          issueIdentifier: "TWO-1",
+          url: "/TWO/issues/TWO-1",
+          createdAt: "2026-10-31T11:00:00.000Z",
+          audience: "owner",
+          interactionKind: "request_confirmation",
+          originKind: null,
+          originId: null,
+        },
+      },
+    );
+    harness.seed({
+      issues: [issue("i-1", "TWO-1")],
+      issueInteractions: [interaction("ix-1", "i-1", { addresseeUserId: OPERATOR } as Partial<Interaction>)],
+    });
+    await harness.runJob(SCAN_JOB_KEY);
+    // The dedupe key (kind:id:createdAt) is unchanged: only waiters that skipped
+    // the old audience without marking it seen wake, and a rescan stays quiet.
+    expect(emitted.map((e) => e.event)).toEqual([
+      {
+        kind: "interaction",
+        id: "ix-1",
+        issueIdentifier: "TWO-1",
+        url: "/TWO/issues/TWO-1",
+        createdAt: "2026-10-31T11:00:00.000Z",
+        audience: "operator",
+        interactionKind: "request_confirmation",
+        originKind: null,
+        originId: null,
+      },
+    ]);
+    await harness.runJob(SCAN_JOB_KEY);
+    expect(emitted).toHaveLength(1);
+  });
 });
 
 describe("no payload text", () => {
