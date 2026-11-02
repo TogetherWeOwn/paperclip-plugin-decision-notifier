@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "togetherweown.decision-notifier";
-export const PLUGIN_VERSION = "0.3.4";
+export const PLUGIN_VERSION = "0.3.5";
 export const STREAM_CHANNEL = "decisions";
 export const SCAN_JOB_KEY = "decision-scan";
 
@@ -62,7 +62,7 @@ const manifest: PaperclipPluginManifestV1 = {
         items: { type: "string" },
         default: [],
         description:
-          "User IDs whose assigned open cards count as decisions. Empty means any card assigned to a human user.",
+          "User IDs whose assigned open cards count as decisions, and the only addressees tagged with the `owner` audience (any other addressed user is `operator`). Empty means any card assigned to a human user, and any addressed user is tagged `owner`.",
       },
       runFailures: {
         type: "object",

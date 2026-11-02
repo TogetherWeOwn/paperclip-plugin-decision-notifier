@@ -23,9 +23,9 @@ export type DecisionKind = "approval" | "interaction" | "owner_card";
 export type EventKind = DecisionKind | "run_failure";
 
 /** Who should act on a decision event. A routing hint for wake-up/skip decisions, never authorization. */
-export type DecisionAudience = "owner" | "board" | "anyone";
+export type DecisionAudience = "owner" | "operator" | "board" | "anyone";
 
-const AUDIENCES: readonly DecisionAudience[] = ["owner", "board", "anyone"];
+const AUDIENCES: readonly DecisionAudience[] = ["owner", "operator", "board", "anyone"];
 
 /**
  * The only shape that ever leaves the plugin. IDs, URLs and host-derived
@@ -936,10 +936,18 @@ export class DecisionNotifier {
   /**
    * Routing hint for an interaction: a user addressee needs that user, a
    * `human_only` interaction needs a human on the board, and anything else
-   * any agent consumer may resolve.
+   * any agent consumer may resolve. An addressed user is `owner` only when
+   * they are a configured owner; when `ownerUserIds` is empty any addressed
+   * user keeps today's `owner` label, and any other addressed user (for
+   * example the operator user that board/host steps are addressed to) is
+   * `operator`, so an operator step is not misrouted to the owner.
    */
-  private interactionAudience(interaction: Interaction): DecisionAudience {
-    if (interaction.addresseeUserId) return "owner";
+  private interactionAudience(interaction: Interaction, config: NotifierConfig): DecisionAudience {
+    if (interaction.addresseeUserId) {
+      return config.ownerUserIds.length === 0 || config.ownerUserIds.includes(interaction.addresseeUserId)
+        ? "owner"
+        : "operator";
+    }
     if (interaction.effectiveResolverPolicy === "human_only") return "board";
     return "anyone";
   }
@@ -956,7 +964,7 @@ export class DecisionNotifier {
         issueIdentifier: issue.identifier,
         url: this.issueUrl(issue, config),
         createdAt: isoString(interaction.createdAt),
-        audience: this.interactionAudience(interaction),
+        audience: this.interactionAudience(interaction, config),
         interactionKind: interaction.kind,
         originKind: issue.originKind ?? null,
         originId: issue.originId ?? null,
