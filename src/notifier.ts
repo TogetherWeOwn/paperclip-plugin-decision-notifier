@@ -887,10 +887,11 @@ export class DecisionNotifier {
     for (const [key, decision] of Object.entries(build(stored))) {
       const previous = stored[key];
       next[key] = previous ? { ...decision, createdAt: previous.createdAt } : decision;
-      // Compare against the normalized previous event: a stored entry from
-      // before routing fields existed reads as "board", so an unchanged
-      // approval is not re-announced just because its raw audience is absent.
-      if (!previous || toEvent(previous).audience !== decision.audience) fresh.push(next[key]);
+      // Compare normalized on both sides: a stored entry from before routing
+      // fields existed reads as "board" on the way out, and an event path may
+      // hand it back retained verbatim (audience absent). Either side left raw
+      // would re-announce unchanged legacy entries on every such commit.
+      if (!previous || toEvent(previous).audience !== toEvent(decision).audience) fresh.push(next[key]);
     }
     if (!samePending(next, stored)) await this.save(companyId, next);
     if (emitNew) for (const decision of fresh) this.emit(companyId, decision);

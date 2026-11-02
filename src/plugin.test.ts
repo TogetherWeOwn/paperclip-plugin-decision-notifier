@@ -644,6 +644,30 @@ describe("routing fields", () => {
     await harness.runJob(SCAN_JOB_KEY);
     expect(emitted).toHaveLength(1);
   });
+
+  it("does not re-announce a legacy stored entry on an unrelated issue update", async () => {
+    const { harness, emitted } = await setup();
+    // A pending approval stored before routing fields existed. An issue event
+    // retains it verbatim: no stored audience to compare, so a one-sided
+    // normalized comparison would announce it again on every such update.
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: COMPANY, stateKey: "pending" },
+      {
+        "approval:ap-1": {
+          kind: "approval",
+          id: "ap-1",
+          issueId: null,
+          issueIdentifier: null,
+          url: "/TWO/approvals/ap-1",
+          createdAt: "2026-10-31T12:00:00.000Z",
+        },
+      },
+    );
+    harness.seed({ approvals: [approval("ap-1")], issues: [issue("i-1", "TWO-1")] });
+    await harness.emit("issue.updated", {}, { companyId: COMPANY, entityId: "i-1" });
+    await harness.emit("issue.updated", {}, { companyId: COMPANY, entityId: "i-1" });
+    expect(emitted).toEqual([]);
+  });
 });
 
 describe("no payload text", () => {
