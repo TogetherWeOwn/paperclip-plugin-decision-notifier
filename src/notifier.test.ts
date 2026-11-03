@@ -347,7 +347,7 @@ describe("config parsing", () => {
   it("announces a card assigned to a non-owner user as an operator decision", async () => {
     const { harness, notifier } = setup({ ownerUserIds: [OWNER] });
     harness.seed({
-      issues: [issue("i-9", "TWO-9", { assigneeUserId: "user-operator" } as Partial<Issue>)],
+      issues: [issue("i-9", "TWO-9", { assigneeUserId: "user-operator", assigneeAgentId: null } as Partial<Issue>)],
     });
     const pending = await notifier.scanCompany(COMPANY, { emitNew: false });
     expect(pending.map((e) => `${e.kind}:${e.id}:${e.audience}`)).toEqual(["owner_card:i-9:operator"]);
@@ -356,7 +356,7 @@ describe("config parsing", () => {
   it("keeps an owner-assigned card as an owner decision", async () => {
     const { harness, notifier } = setup({ ownerUserIds: [OWNER] });
     harness.seed({
-      issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>)],
+      issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER, assigneeAgentId: null } as Partial<Issue>)],
     });
     const pending = await notifier.scanCompany(COMPANY, { emitNew: false });
     expect(pending.map((e) => `${e.kind}:${e.id}:${e.audience}`)).toEqual(["owner_card:i-1:owner"]);
