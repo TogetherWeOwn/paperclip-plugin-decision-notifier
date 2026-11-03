@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "togetherweown.decision-notifier";
-export const PLUGIN_VERSION = "0.3.5";
+export const PLUGIN_VERSION = "0.3.6";
 export const STREAM_CHANNEL = "decisions";
 export const SCAN_JOB_KEY = "decision-scan";
 
@@ -11,7 +11,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "Decision Notifier",
   description:
-    "Pushes pending board decisions (approvals, thread interactions and owner-assigned cards) and grouped failed agent runs onto a board-readable plugin stream, so an operator session can wait on it instead of polling. Decision events carry IDs and URLs only; run failures add a short redacted error excerpt.",
+    "Pushes pending board decisions (approvals, thread interactions and user-assigned cards) and grouped failed agent runs onto a board-readable plugin stream, so an operator session can wait on it instead of polling. Decision events carry IDs and URLs only; run failures add a short redacted error excerpt.",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
@@ -34,7 +34,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: SCAN_JOB_KEY,
       displayName: "Scan for pending decisions",
       description:
-        "Reconciles pending approvals, thread interactions and owner-assigned cards every minute, and failed agent runs every five minutes. Thread interactions are not plugin events yet (paperclipai/paperclip#4990), so this scan is how they are found.",
+        "Reconciles pending approvals, thread interactions and user-assigned cards every minute, and failed agent runs every five minutes. Thread interactions are not plugin events yet (paperclipai/paperclip#4990), so this scan is how they are found.",
       schedule: "* * * * *",
     },
   ],
@@ -62,7 +62,7 @@ const manifest: PaperclipPluginManifestV1 = {
         items: { type: "string" },
         default: [],
         description:
-          "User IDs whose assigned open cards count as decisions, and the only addressees tagged with the `owner` audience (any other addressed user is `operator`). Empty means any card assigned to a human user, and any addressed user is tagged `owner`.",
+          "User IDs tagged with the `owner` audience: cards assigned to one of them are `owner` decisions and interactions addressed to one of them are `owner`. Any other assigned or addressed user is `operator`. Empty means any card assigned to a user, and any addressed user, is tagged `owner`.",
       },
       runFailures: {
         type: "object",

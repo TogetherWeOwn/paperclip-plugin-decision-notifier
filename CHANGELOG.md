@@ -4,6 +4,10 @@
 
 (nothing yet)
 
+## 0.3.6
+
+- Fixed open cards assigned to a non-owner user never reaching the decision stream. `isOwnerCard` treated a user-assigned card as a decision only when its assignee was in the configured `ownerUserIds`, and the live config lists only the owner — so operator-assigned cards were dropped silently. Every open card assigned to a user is now a decision (`kind: "owner_card"`), with the audience split mirroring the interaction rule: `owner` when the assignee is in `ownerUserIds` (or that list is empty, keeping the previous behaviour), else `operator`. A pending card whose audience changes on this upgrade is announced again on the next scan with its first-seen `createdAt`, keeping its dedupe key. README tables, the manifest `ownerUserIds` description and the package description now say user-assigned cards.
+
 ## 0.3.5
 
 - Fixed every user-addressed interaction being tagged `audience: "owner"`. Board/host steps addressed to the operator user were indistinguishable from owner decisions, so a consumer filtered by `--audience` routed them wrong and the owner/operator split was lost. An addressed interaction is now `owner` only when its `addresseeUserId` is in the configured `ownerUserIds` (or that list is empty, keeping the previous behaviour), and `operator` for any other addressed user. Unaddressed interactions are unchanged (`board` for `human_only`, else `anyone`), as are approvals (`board`) and owner cards (`owner`) — owner cards are already gated on `ownerUserIds`. A decision whose audience is reclassified while still pending (as stored operator steps are on this upgrade) is announced again on the next scan with its first-seen `createdAt`, keeping its dedupe key: consumers that already announced it stay quiet, and a waiter filtered to the new audience wakes. `paperclip-decision-wait` accepts `operator` in `--audience` and prints it. To use the split, set the owner's user ID in `ownerUserIds`: with the list empty, every addressed user is still `owner`.

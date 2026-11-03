@@ -928,9 +928,28 @@ export class DecisionNotifier {
     return out;
   }
 
-  private isOwnerCard(issue: Issue, config: NotifierConfig): boolean {
+  /**
+   * A board decision is an open card assigned to a user: owner-assigned
+   * cards and operator-assigned cards alike. The audience split (owner vs
+   * operator) happens in `ownerCardDecision`, mirroring `interactionAudience`.
+   */
+  private isOwnerCard(issue: Issue, _config: NotifierConfig): boolean {
     if (!issue.assigneeUserId || !hasStatus(issue, OPEN_ISSUE_STATUSES)) return false;
-    return config.ownerUserIds.length === 0 || config.ownerUserIds.includes(issue.assigneeUserId);
+    return true;
+  }
+
+  /**
+   * Routing hint for an assigned card: the assignee is `owner` only when
+   * they are a configured owner; when `ownerUserIds` is empty any assignee
+   * keeps today's `owner` label, and any other assignee (for example the
+   * operator user that board/host steps are assigned to) is `operator`,
+   * so an operator card is not misrouted to the owner. Same rule as
+   * `interactionAudience`.
+   */
+  private ownerCardAudience(issue: Issue, config: NotifierConfig): DecisionAudience {
+    return config.ownerUserIds.length === 0 || config.ownerUserIds.includes(issue.assigneeUserId as string)
+      ? "owner"
+      : "operator";
   }
 
   /**
@@ -990,7 +1009,7 @@ export class DecisionNotifier {
       url: this.issueUrl(issue, config),
       // The card's last change is the closest available stamp for the assignment.
       createdAt: isoString(issue.updatedAt),
-      audience: "owner",
+      audience: this.ownerCardAudience(issue, config),
       interactionKind: null,
       originKind: issue.originKind ?? null,
       originId: issue.originId ?? null,

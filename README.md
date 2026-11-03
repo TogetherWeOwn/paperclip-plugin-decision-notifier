@@ -8,7 +8,7 @@ A decision is one of:
 |---|---|---|
 | `approval` | approval status is `pending` | `approval.created` / `approval.decided` events, plus the periodic scan |
 | `interaction` | a thread interaction (decision card) is `pending`, not addressed to an agent, on a card that is not done or cancelled | the periodic scan, and `issue.created` / `issue.updated` events for that card |
-| `owner_card` | an open card (`todo`, `in_progress`, `in_review`, `blocked`) is assigned to an owner user | `issue.created` / `issue.updated` events, plus the periodic scan |
+| `owner_card` | an open card (`todo`, `in_progress`, `in_review`, `blocked`) is assigned to a user | `issue.created` / `issue.updated` events, plus the periodic scan |
 
 Agent-addressed interactions are left out on purpose: Paperclip already wakes that agent.
 
@@ -36,7 +36,7 @@ There is no title, summary, payload or comment text. That text is written by age
 
 The four routing fields are host-derived hints for wake-up/skip decisions, never authorization:
 
-- `audience` is one of `owner`, `operator`, `board` or `anyone`. An interaction addressed to a configured owner user (`ownerUserIds`) is `owner`; an interaction addressed to any other user (for example the operator user that board/host steps are addressed to) is `operator`; when `ownerUserIds` is empty any addressed user is `owner`, as before. Otherwise an interaction whose effective resolver policy is `human_only` is `board`; anything else is `anyone`. Approvals are `board`; owner-assigned cards are `owner`.
+- `audience` is one of `owner`, `operator`, `board` or `anyone`. An interaction addressed to a configured owner user (`ownerUserIds`) is `owner`; an interaction addressed to any other user (for example the operator user that board/host steps are addressed to) is `operator`; when `ownerUserIds` is empty any addressed user is `owner`, as before. Otherwise an interaction whose effective resolver policy is `human_only` is `board`; anything else is `anyone`. Approvals are `board`. A card assigned to a configured owner user is `owner`; a card assigned to any other user (for example the operator user) is `operator`; when `ownerUserIds` is empty any assigned card is `owner`, as before.
 - `interactionKind` is the interaction's kind (`request_confirmation`, `ask_user_questions`, …) for interactions, `null` otherwise.
 - `originKind` / `originId` are the issue's origin, passed through verbatim and never parsed by this plugin; they are `null` for approvals, which belong to no issue. Events on cards the board council created carry `originKind: "plugin:board-council"`.
 
@@ -98,7 +98,7 @@ paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-deci
 | key | default | meaning |
 |---|---|---|
 | `publicBaseUrl` | `""` | Web app base URL for event links. Links are relative paths when empty. |
-| `ownerUserIds` | `[]` | User IDs whose assigned open cards count as decisions, and the only addressees tagged with the `owner` audience (any other addressed user is `operator`). Empty means any card assigned to a user, and any addressed user is tagged `owner`. Set the owner to keep operator-addressed steps (`operator`) apart from owner decisions. |
+| `ownerUserIds` | `[]` | User IDs tagged with the `owner` audience: cards assigned to one of them are `owner` decisions and interactions addressed to one of them are `owner`. Any other assigned or addressed user is `operator`. Empty means any card assigned to a user, and any addressed user, is tagged `owner`. Set the owner to keep operator-assigned cards and operator-addressed steps (`operator`) apart from owner decisions. |
 | `runFailures.enabled` | `true` | Announce failed and timed-out agent runs. When `false`, run failures are neither collected nor replayed. |
 | `runFailures.windowMinutes` | `30` | Length of the fixed grouping window, 1 to 1440. Invalid values fall back to 30. |
 

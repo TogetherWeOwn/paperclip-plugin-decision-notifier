@@ -1,7 +1,7 @@
 {
   "name": "@togetherweown/paperclip-plugin-decision-notifier",
-  "version": "0.3.5",
-  "description": "Paperclip plugin that pushes pending board decisions (approvals, thread interactions, owner-assigned cards) and grouped failed agent runs onto a board-readable SSE stream.",
+  "version": "0.3.6",
+  "description": "Paperclip plugin that pushes pending board decisions (approvals, thread interactions, user-assigned cards) and grouped failed agent runs onto a board-readable SSE stream.",
   "license": "MIT",
   "type": "module",
   "homepage": "https://github.com/TogetherWeOwn/paperclip-plugin-decision-notifier",
