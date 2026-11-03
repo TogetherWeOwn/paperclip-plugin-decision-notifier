@@ -362,6 +362,16 @@ describe("config parsing", () => {
     expect(pending.map((e) => `${e.kind}:${e.id}:${e.audience}`)).toEqual(["owner_card:i-1:owner"]);
   });
 
+  it("emits an operator owner_card when an issue event arrives for a non-owner assignee", async () => {
+    const { harness, emitted, notifier } = setup({ ownerUserIds: [OWNER] });
+    harness.seed({
+      issues: [issue("i-9", "TWO-9", { assigneeUserId: "user-operator", assigneeAgentId: null } as Partial<Issue>)],
+    });
+    await notifier.onIssueEvent(COMPANY, "i-9");
+    const decisions = emitted.filter((e): e is DecisionEvent => e.kind !== "run_failure");
+    expect(decisions.map((e) => `${e.kind}:${e.id}:${e.audience}`)).toEqual(["owner_card:i-9:operator"]);
+  });
+
   it("treats a non-array ownerUserIds as no restriction", async () => {
     const { harness, notifier } = setup({ ownerUserIds: OWNER });
     harness.seed({ issues: [issue("i-1", "TWO-1", { assigneeUserId: "anyone" } as Partial<Issue>)] });
