@@ -147,8 +147,8 @@ describe("scan job", () => {
     expect(byKind.owner_card.url).toBe("https://pc.example.com/TWO/issues/TWO-2");
   });
 
-  it("limits owner cards to the configured owners", async () => {
-    const { harness, ids } = await setup({ ownerUserIds: [OWNER] });
+  it("announces every user-assigned card, splitting owner and operator audiences", async () => {
+    const { harness, emitted } = await setup({ ownerUserIds: [OWNER] });
     harness.seed({
       issues: [
         issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>),
@@ -156,7 +156,11 @@ describe("scan job", () => {
       ],
     });
     await harness.runJob(SCAN_JOB_KEY);
-    expect(ids()).toEqual(["owner_card:i-1"]);
+    const cards = emitted
+      .filter((e) => e.event.kind === "owner_card")
+      .map((e) => `${e.event.id}:${e.event.audience}`)
+      .sort();
+    expect(cards).toEqual(["i-1:owner", "i-2:operator"]);
   });
 
   it("scans a company learned from company.created when companies.list is denied", async () => {
@@ -478,6 +482,7 @@ describe("routing fields", () => {
       approvals: [approval("ap-1")],
       issues: [
         issue("i-owner", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>),
+        issue("i-operator", "TWO-3", { assigneeUserId: OPERATOR } as Partial<Issue>),
         issue("i-plain", "TWO-2"),
       ],
       issueInteractions: [
@@ -504,6 +509,7 @@ describe("routing fields", () => {
     expect(audienceOf("interaction", "ix-not-creator")).toBe("anyone");
     expect(audienceOf("approval", "ap-1")).toBe("board");
     expect(audienceOf("owner_card", "i-owner")).toBe("owner");
+    expect(audienceOf("owner_card", "i-operator")).toBe("operator");
   });
 
   it("keeps the owner label for any addressed user when ownerUserIds is empty", async () => {

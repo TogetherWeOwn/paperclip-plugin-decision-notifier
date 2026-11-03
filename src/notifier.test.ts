@@ -336,7 +336,30 @@ describe("config parsing", () => {
       ],
     });
     const pending = await notifier.scanCompany(COMPANY, { emitNew: false });
-    expect(pending.map((e) => e.id)).toEqual(["i-1"]);
+    // Both user-assigned cards are decisions; the audience splits on the
+    // parsed owner list (junk entries dropped): owner vs operator.
+    expect(pending.map((e) => e.id)).toEqual(["i-1", "i-2"]);
+    const audienceOf = (id: string) => pending.find((e) => e.id === id)?.audience;
+    expect(audienceOf("i-1")).toBe("owner");
+    expect(audienceOf("i-2")).toBe("operator");
+  });
+
+  it("announces a card assigned to a non-owner user as an operator decision", async () => {
+    const { harness, notifier } = setup({ ownerUserIds: [OWNER] });
+    harness.seed({
+      issues: [issue("i-9", "TWO-9", { assigneeUserId: "user-operator" } as Partial<Issue>)],
+    });
+    const pending = await notifier.scanCompany(COMPANY, { emitNew: false });
+    expect(pending.map((e) => `${e.kind}:${e.id}:${e.audience}`)).toEqual(["owner_card:i-9:operator"]);
+  });
+
+  it("keeps an owner-assigned card as an owner decision", async () => {
+    const { harness, notifier } = setup({ ownerUserIds: [OWNER] });
+    harness.seed({
+      issues: [issue("i-1", "TWO-1", { assigneeUserId: OWNER } as Partial<Issue>)],
+    });
+    const pending = await notifier.scanCompany(COMPANY, { emitNew: false });
+    expect(pending.map((e) => `${e.kind}:${e.id}:${e.audience}`)).toEqual(["owner_card:i-1:owner"]);
   });
 
   it("treats a non-array ownerUserIds as no restriction", async () => {
