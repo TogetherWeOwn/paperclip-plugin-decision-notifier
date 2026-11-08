@@ -110,7 +110,7 @@ export const OPEN_ISSUE_STATUSES = ["todo", "in_progress", "in_review", "blocked
 /** Statuses that can hold a pending interaction: Paperclip expires them only on done/cancelled. */
 export const INTERACTION_ISSUE_STATUSES = ["backlog", ...OPEN_ISSUE_STATUSES] as const;
 const INTERACTION_READ_CONCURRENCY = 8;
-/** A catch-up this soon after the previous catch-up scan replays the stored set instead of rescanning. */
+/** A catch-up this soon after any completed decision scan replays the stored set instead of rescanning. */
 export const CATCH_UP_RESCAN_MS = 10_000;
 /** Failed runs are reconciled at most this often per company; the cursor makes the interval lossless. */
 export const RUN_RECONCILE_INTERVAL_MS = 5 * 60_000;
@@ -243,8 +243,8 @@ export class DecisionNotifier {
   private readonly locks = new Map<string, Promise<unknown>>();
   /** Company the stream channel is currently opened for; emit() routes to it. */
   private openedCompanyId: string | null = null;
-  /** Each company's last catch-up scan: when it finished and the config it used. */
-  private readonly lastCatchUpScan = new Map<string, { at: number; config: string }>();
+  /** Each company's last complete decision scan: when it finished and the config it used. */
+  private readonly lastDecisionScan = new Map<string, { at: number; config: string }>();
   /** When each company's failed runs were last reconciled. */
   private readonly lastRunReconcile = new Map<string, number>();
   /** Each company's in-flight reconciliation; the throttle above is stamped only after a pass. */
@@ -508,7 +508,7 @@ export class DecisionNotifier {
   /**
    * Catch-up for a client that just connected to the stream: rescan, then
    * replay every pending decision onto the stream and return the same list.
-   * Catch-ups within CATCH_UP_RESCAN_MS of the last catch-up scan, with the
+   * Catch-ups within CATCH_UP_RESCAN_MS of any completed decision scan, with the
    * same config and prefix, reuse the stored set instead, so a client calling
    * in a loop cannot make the worker rescan the whole company each time.
    * Approval and card events keep that set current; a thread interaction has
@@ -517,19 +517,24 @@ export class DecisionNotifier {
    * are replayed too; they are kept current by events and the scan job.
    */
   async catchUp(companyId: string): Promise<NotifierEvent[]> {
+    const startedAt = performance.now();
     await this.noteCompany(companyId);
+    const queuedAt = performance.now();
+    let queueMs = 0;
+    let rescanned = false;
     const pending = await this.withLock(companyId, async () => {
+      queueMs = performance.now() - queuedAt;
       const config = await this.config(companyId);
       const configKey = JSON.stringify(config);
-      const last = this.lastCatchUpScan.get(companyId);
+      const last = this.lastDecisionScan.get(companyId);
       // A negative age means the clock moved back; rescan rather than trust the window.
       const age = last ? Date.now() - last.at : -1;
       let decisions: DecisionEvent[];
       if (last && last.config === configKey && age >= 0 && age < CATCH_UP_RESCAN_MS) {
         decisions = Object.values(await this.load(companyId)).map(toEvent);
       } else {
-        decisions = await this.scanLocked(companyId, false);
-        this.lastCatchUpScan.set(companyId, { at: Date.now(), config: configKey });
+        rescanned = true;
+        decisions = await this.scanLocked(companyId, false, config);
       }
       const cutoff = Date.now() - RUN_FAILURE_RETENTION_MS;
       const failures = config.runFailures.enabled
@@ -540,6 +545,13 @@ export class DecisionNotifier {
       return [...decisions, ...failures];
     });
     for (const event of pending) this.emitEvent(companyId, event);
+    this.ctx.logger.info("decision catch-up completed", {
+      companyId,
+      durationMs: Math.round(performance.now() - startedAt),
+      queueMs: Math.round(queueMs),
+      rescanned,
+      pending: pending.length,
+    });
     return pending;
   }
 
@@ -861,9 +873,13 @@ export class DecisionNotifier {
   }
 
   /** Collect and commit one company. Call with the company lock held. */
-  private async scanLocked(companyId: string, emitNew: boolean): Promise<DecisionEvent[]> {
-    const current = await this.collect(companyId);
+  private async scanLocked(companyId: string, emitNew: boolean, config?: NotifierConfig): Promise<DecisionEvent[]> {
+    config ??= await this.config(companyId);
+    const current = await this.collect(companyId, config);
     const next = await this.commit(companyId, () => current, emitNew);
+    // A job/event scan is just as fresh as a catch-up scan. Stamp only after
+    // the entire read and commit succeed; failed scans never extend the cache.
+    this.lastDecisionScan.set(companyId, { at: Date.now(), config: JSON.stringify(config) });
     return Object.values(next).map(toEvent);
   }
 
@@ -898,22 +914,41 @@ export class DecisionNotifier {
     return next;
   }
 
-  private async collect(companyId: string): Promise<PendingMap> {
-    const config = await this.config(companyId);
+  private async collect(companyId: string, config: NotifierConfig): Promise<PendingMap> {
+    const startedAt = performance.now();
     const out: PendingMap = {};
-    for (const approval of await this.ctx.approvals.list({ companyId, status: "pending" })) {
+    const approvals = await this.ctx.approvals.list({ companyId, status: "pending" });
+    for (const approval of approvals) {
       out[decisionKey("approval", approval.id)] = this.approvalDecision(approval, config);
     }
+    const listedAt = performance.now();
     const issues = await this.listIssues(companyId);
+    const interactionsAt = performance.now();
+    const counts = { interactions: 0 };
     for (const issue of issues) {
       if (this.isOwnerCard(issue, config)) {
         out[decisionKey("owner_card", issue.id)] = this.ownerCardDecision(issue, config);
       }
     }
     const perIssue = await mapLimit(issues, INTERACTION_READ_CONCURRENCY, (issue) =>
-      this.interactionDecisions(companyId, issue, config),
+      this.interactionDecisions(companyId, issue, config, counts),
     );
     for (const decisions of perIssue) Object.assign(out, decisions);
+    this.ctx.logger.info("decision scan query profile", {
+      companyId,
+      durationMs: Math.round(performance.now() - startedAt),
+      approvalsMs: Math.round(listedAt - startedAt),
+      issueListsMs: Math.round(interactionsAt - listedAt),
+      interactionsMs: Math.round(performance.now() - interactionsAt),
+      approvalListCalls: 1,
+      issueListCalls: INTERACTION_ISSUE_STATUSES.length,
+      interactionListCalls: issues.length,
+      approvals: approvals.length,
+      issues: issues.length,
+      interactions: counts.interactions,
+      concurrency: INTERACTION_READ_CONCURRENCY,
+      pending: Object.keys(out).length,
+    });
     return out;
   }
 
@@ -979,9 +1014,15 @@ export class DecisionNotifier {
     return "anyone";
   }
 
-  private async interactionDecisions(companyId: string, issue: Issue, config: NotifierConfig): Promise<PendingMap> {
+  private async interactionDecisions(
+    companyId: string,
+    issue: Issue,
+    config: NotifierConfig,
+    counts?: { interactions: number },
+  ): Promise<PendingMap> {
     const out: PendingMap = {};
     const interactions = await this.ctx.issues.listInteractions(issue.id, companyId);
+    if (counts) counts.interactions += interactions.length;
     for (const interaction of interactions) {
       if (!this.isBoardInteraction(interaction)) continue;
       out[decisionKey("interaction", interaction.id)] = {

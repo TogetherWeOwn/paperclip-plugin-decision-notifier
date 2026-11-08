@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Block until the decision stream announces a decision (or a failed-run group)
-// this client has not seen, print it as one JSON line, and exit 0. Exit 1 on any connection or
-// auth failure, so the caller re-arms (or reports) instead of hanging.
+// this client has not seen, print it as one JSON line, and exit 0. Exit 1 on stream or
+// auth failure, or after bounded catch-up retries, so the caller re-arms instead of hanging.
 // If the host answers the stream with HTTP 501 (no plugin stream bus, as in
 // stock Paperclip 2026.1023.0), poll the catch-up route every 30 s instead.
 //
@@ -26,7 +26,11 @@ function delayFromEnv(name, fallback) {
   return Number.isInteger(value) && value >= 1 && value <= 2 ** 31 - 1 ? value : fallback;
 }
 /** Deadline for the catch-up call, the stream's response headers and its first frame, not for the idle stream. */
-const REQUEST_TIMEOUT_MS = delayFromEnv("PAPERCLIP_DECISION_WAIT_TIMEOUT_MS", 30_000);
+const REQUEST_TIMEOUT_MS = delayFromEnv("PAPERCLIP_DECISION_WAIT_TIMEOUT_MS", 120_000);
+/** At most three catch-up attempts, with 500 ms then 1000 ms backoff; auth and other client failures fail fast. */
+const CATCH_UP_ATTEMPTS = 3;
+const CATCH_UP_BACKOFF_MS = 500;
+const RETRYABLE_HTTP = new Set([408, 429, 500, 502, 503, 504]);
 /** Catch-up interval when the host has no stream bridge. */
 const POLL_INTERVAL_MS = delayFromEnv("PAPERCLIP_DECISION_WAIT_POLL_MS", 30_000);
 /** Idle time before TCP keepalive probes start, so a dead connection still fails the stream. */
@@ -167,17 +171,41 @@ function announce(decision) {
   return true;
 }
 
+/** Retry only transport failures, timeouts and explicitly transient HTTP statuses. */
+async function fetchCatchUp() {
+  for (let attempt = 1; attempt <= CATCH_UP_ATTEMPTS; attempt += 1) {
+    // One deadline per attempt, including the body, not just response headers.
+    const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    let retryable;
+    let reason;
+    try {
+      const response = await fetch(`${apiBase}/api/plugins/${plugin}/api/catch-up`, {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ companyId: args.company }),
+        signal,
+      });
+      if (response.ok) return await response.json();
+      reason = `HTTP ${response.status}`;
+      retryable = RETRYABLE_HTTP.has(response.status);
+      // Do not read or log error bodies: they can contain credentials or host text.
+      await response.body?.cancel().catch(() => {});
+    } catch (err) {
+      retryable = signal.aborted || err instanceof TypeError;
+      // Neither fetch errors nor JSON parse errors are safe to echo verbatim.
+      reason = signal.aborted ? "request timed out" : err instanceof SyntaxError ? "invalid JSON response" : "network error";
+    }
+    if (!retryable || attempt === CATCH_UP_ATTEMPTS) fail(`catch-up failed: ${reason}`);
+    await new Promise((resolve) => setTimeout(resolve, CATCH_UP_BACKOFF_MS * 2 ** (attempt - 1)));
+  }
+}
+
 async function catchUp() {
-  const response = await fetch(`${apiBase}/api/plugins/${plugin}/api/catch-up`, {
-    method: "POST",
-    headers: { ...headers, "Content-Type": "application/json" },
-    body: JSON.stringify({ companyId: args.company }),
-    // Covers reading the body too, so a stalled response cannot block the stream.
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  }).catch((err) => fail(`catch-up failed: ${err.message}`));
-  if (!response.ok) fail(`catch-up failed: HTTP ${response.status}`);
-  const body = await response.json().catch((err) => fail(`catch-up failed: ${err.message}`));
-  const pending = Array.isArray(body?.pending) ? body.pending.map((e) => parseDecision(JSON.stringify(e))).filter(Boolean) : [];
+  const body = await fetchCatchUp();
+  if (!Array.isArray(body?.pending)) fail("catch-up failed: invalid pending snapshot");
+  const pending = body.pending.map((e) => parseDecision(JSON.stringify(e)));
+  // A missing or malformed snapshot is not evidence that a seen decision was resolved.
+  if (pending.some((event) => event === null)) fail("catch-up failed: invalid pending snapshot");
   if (args.seen) {
     // Forget decisions that were resolved, so they announce again if they come back.
     const pendingKeys = new Set(pending.map(seenKey));

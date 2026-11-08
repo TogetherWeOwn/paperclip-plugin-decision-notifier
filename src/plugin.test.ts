@@ -348,8 +348,10 @@ describe("catch-up", () => {
     await harness.runJob(SCAN_JOB_KEY);
     emitted.length = 0;
 
-    // ap-1 gets decided between scans; catch-up must not replay it.
+    // Approval events keep the recent scan's stored snapshot current.
     harness.seed({ approvals: [approval("ap-1", { status: "rejected" } as Partial<Approval>)] });
+    await harness.emit("approval.decided", {}, { companyId: COMPANY, entityId: "ap-1" });
+    emitted.length = 0;
     const response = await catchUp();
 
     const expected = ["interaction:ix-1", "owner_card:i-2"];
@@ -367,6 +369,51 @@ describe("catch-up", () => {
     // Already announced by catch-up; the next scan must not announce it again.
     await harness.runJob(SCAN_JOB_KEY);
     expect(ids()).toEqual(["approval:ap-new"]);
+  });
+
+  it("reuses a completed job scan across 600 cards without another board query", async () => {
+    const { harness } = await setup({ runFailures: { enabled: false } });
+    harness.seed({
+      issues: Array.from({ length: 600 }, (_, i) => issue(`i-${i}`, `TWO-${i}`)),
+      issueInteractions: [interaction("ix-1", "i-1")],
+    });
+    const lists = vi.spyOn(harness.ctx.issues, "list");
+    const reads = vi.spyOn(harness.ctx.issues, "listInteractions");
+    const approvals = vi.spyOn(harness.ctx.approvals, "list");
+    const logs = vi.spyOn(harness.ctx.logger, "info");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      await harness.runJob(SCAN_JOB_KEY);
+      expect(reads).toHaveBeenCalledTimes(600);
+      expect(logs).toHaveBeenCalledWith("decision scan query profile", expect.objectContaining({
+        approvalListCalls: 1, issueListCalls: 5, interactionListCalls: 600,
+        issues: 600, interactions: 1, concurrency: 8,
+      }));
+      lists.mockClear();
+      reads.mockClear();
+      approvals.mockClear();
+      const response = await catchUp();
+      expect((response.body as { pending: DecisionEvent[] }).pending.map((e) => e.id)).toEqual(["ix-1"]);
+      expect(lists).not.toHaveBeenCalled();
+      expect(reads).not.toHaveBeenCalled();
+      expect(approvals).not.toHaveBeenCalled();
+      expect(logs).toHaveBeenCalledWith("decision catch-up completed", expect.objectContaining({ rescanned: false }));
+      vi.advanceTimersByTime(CATCH_UP_RESCAN_MS);
+      await catchUp();
+      expect(reads).toHaveBeenCalledTimes(600);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not extend scan freshness after a failed job scan", async () => {
+    const { harness } = await setup({ runFailures: { enabled: false } });
+    harness.seed({ issues: [issue("i-1", "TWO-1")], issueInteractions: [interaction("ix-1", "i-1")] });
+    const reads = vi.spyOn(harness.ctx.issues, "listInteractions").mockRejectedValueOnce(new Error("read failed"));
+    await harness.runJob(SCAN_JOB_KEY);
+    const response = await catchUp();
+    expect((response.body as { pending: DecisionEvent[] }).pending.map((e) => e.id)).toEqual(["ix-1"]);
+    expect(reads).toHaveBeenCalledTimes(2);
   });
 
   it("rescans at most once per window when catch-up is called in a loop", async () => {
