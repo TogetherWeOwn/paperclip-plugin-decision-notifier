@@ -78,6 +78,7 @@ export async function waitForAttention({ apiBase, token, companyId, seenFile, ti
       dismissals.set(row.itemKey, row);
     }
     const now = Date.now();
+    const eligible = [];
     for (const item of items) {
       if (!KINDS.has(item?.sourceKind)) continue;
       const subject = item.subject;
@@ -98,7 +99,7 @@ export async function waitForAttention({ apiBase, token, companyId, seenFile, ti
       if (!text(subject.href, 2048)) throw new Error("attention item has no valid link");
       let url;
       try { url = new URL(subject.href, base); } catch { throw new Error("invalid attention item link"); }
-      if (url.origin !== base.origin || url.username || url.password) throw new Error("invalid attention item link");
+      if (url.origin !== base.origin || url.username || url.password || url.pathname.startsWith("//")) throw new Error("invalid attention item link");
       const event = {
         kind: item.sourceKind,
         id: subject.id,
@@ -110,9 +111,15 @@ export async function waitForAttention({ apiBase, token, companyId, seenFile, ti
         interactionKind: item.sourceKind === "issue_thread_interaction" && text(subject.metadata?.kind) ? subject.metadata.kind : null,
         addresseeUserId: text(audience?.addresseeUserId) ? audience.addresseeUserId : null,
       };
+      eligible.push({ event, key, previous });
+    }
+    // A regularly re-armed waiter must not let a due reminder starve unseen work.
+    eligible.sort((a, b) => (a.previous === null ? -Infinity : a.previous) - (b.previous === null ? -Infinity : b.previous));
+    const next = eligible[0];
+    if (next) {
       // Native attention has no plugin audience/origin hints. Unknown hints pass the old advisory filters.
-      await new Promise((resolve, reject) => process.stdout.write(`${JSON.stringify(event)}\n`, (err) => err ? reject(err) : resolve()));
-      state.delivered(key, now);
+      await new Promise((resolve, reject) => process.stdout.write(`${JSON.stringify(next.event)}\n`, (err) => err ? reject(err) : resolve()));
+      state.delivered(next.key, now);
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, pollMs));

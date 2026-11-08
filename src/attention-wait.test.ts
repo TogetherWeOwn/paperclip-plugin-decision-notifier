@@ -100,6 +100,30 @@ describe("native actor attention waiter", () => {
     expect(api.requests.some((path) => path.includes("plugins"))).toBe(false);
   });
 
+  it("prioritizes unseen asks over due reminders and then the oldest reminder delivery", async () => {
+    const api = await fake({ itemsByCall: [[item("A"), item("B")]] }); const paths = files();
+    writeFileSync(paths.seen, `interaction:A:${createdAt}\n`);
+    const fresh = await run(api.url, paths, { PAPERCLIP_DECISION_WAIT_REMINDER_MS: "1" });
+    expect(JSON.parse(fresh.stdout)).toMatchObject({ id: "B", reminder: false });
+    const scope = JSON.stringify([api.url, "c-1", "operator"]);
+    const now = Date.now();
+    writeFileSync(paths.seen, [
+      { version: 1, scope, key: `interaction:A:${createdAt}`, deliveredAt: now - 1000 },
+      { version: 1, scope, key: `interaction:B:${createdAt}`, deliveredAt: now - 2000 },
+    ].map((record) => JSON.stringify(record)).join("\n"));
+    const oldest = await run(api.url, paths, { PAPERCLIP_DECISION_WAIT_REMINDER_MS: "1" });
+    expect(JSON.parse(oldest.stdout)).toMatchObject({ id: "B", reminder: true });
+  });
+
+  it("rejects a same-origin absolute link whose emitted path would be protocol-relative", async () => {
+    const candidate = item();
+    const api = await fake({ itemsByCall: [[candidate]] });
+    candidate.subject.href = `${api.url}//attacker.invalid/path`;
+    const result = await run(api.url, files());
+    expect(result.code).toBe(1); expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("invalid attention item link");
+  });
+
   it("suppresses reminders inside the interval and stops reminding resolved asks", async () => {
     const api = await fake(); const paths = files();
     await run(api.url, paths);

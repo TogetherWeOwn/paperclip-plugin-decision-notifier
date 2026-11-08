@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -49,6 +49,27 @@ describe("actor delivery ledger", () => {
     expect(deliveryState(file, "actor").previous("bad")).toBeNull();
     writeFileSync(file, "x".repeat(4 * 1024 * 1024 + 1));
     expect(() => deliveryState(file, "actor")).toThrow("seen ledger exceeds 4 MiB");
+  });
+
+  it("keeps serialized output within its own read budget", () => {
+    const file = ledger(); const now = Date.now();
+    writeFileSync(file, JSON.stringify({ version: 1, scope: "actor", key: "x".repeat(4 * 1024 * 1024 - 250), deliveredAt: now }) + "\n");
+    expect(statSync(file).size).toBeLessThan(4 * 1024 * 1024);
+    const key = "new".repeat(100);
+    deliveryState(file, "actor").delivered(key, now + 1);
+    expect(statSync(file).size).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(deliveryState(file, "actor").previous(key)).toBe(now + 1);
+  });
+
+  it("does not follow a planted predictable temporary symlink or leave new temporary files", () => {
+    const file = ledger(); const target = `${file}-target`;
+    writeFileSync(target, "untouched");
+    const planted = `${file}.${process.pid}.tmp`;
+    symlinkSync(target, planted);
+    deliveryState(file, "actor").delivered("ask", Date.now());
+    expect(readFileSync(target, "utf8")).toBe("untouched");
+    expect(statSync(file).isFile()).toBe(true);
+    expect(readdirSync(join(file, ".."))).toHaveLength(3);
   });
 
   it("caps retained delivery records and retires timestamps older than thirty days", () => {

@@ -1,5 +1,7 @@
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 
+const MAX_BYTES = 4 * 1024 * 1024;
 const MAX_RECORDS = 10_000;
 const RETENTION_MS = 30 * 24 * 60 * 60_000;
 
@@ -8,7 +10,7 @@ export function deliveryState(file, scope) {
   const records = new Map();
   const legacy = new Set();
   if (file && existsSync(file)) {
-    if (statSync(file).size > 4 * 1024 * 1024) throw new Error("seen ledger exceeds 4 MiB");
+    if (statSync(file).size > MAX_BYTES) throw new Error("seen ledger exceeds 4 MiB");
     for (const line of readFileSync(file, "utf8").split("\n")) {
       if (!line) continue;
       try {
@@ -39,9 +41,24 @@ export function deliveryState(file, scope) {
       const kept = [...records.values()]
         .filter((record) => record.deliveredAt === 0 || record.deliveredAt >= now - RETENTION_MS)
         .sort((a, b) => b.deliveredAt - a.deliveredAt).slice(0, MAX_RECORDS);
-      const temporary = `${file}.${process.pid}.tmp`;
-      writeFileSync(temporary, kept.map((record) => JSON.stringify(record)).join("\n") + "\n", { mode: 0o600 });
-      renameSync(temporary, file);
+      const lines = [];
+      let bytes = 0;
+      for (const record of kept) {
+        const line = `${JSON.stringify(record)}\n`;
+        const size = Buffer.byteLength(line);
+        if (bytes + size > MAX_BYTES) continue;
+        lines.push(line);
+        bytes += size;
+      }
+      const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+      // Exclusive creation refuses symlinks; clean up only a file we successfully opened.
+      const descriptor = openSync(temporary, "wx", 0o600);
+      try {
+        try { writeFileSync(descriptor, lines.join("")); } finally { closeSync(descriptor); }
+        renameSync(temporary, file);
+      } finally {
+        rmSync(temporary, { force: true });
+      }
     },
   };
 }
