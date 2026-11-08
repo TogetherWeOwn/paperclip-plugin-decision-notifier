@@ -442,6 +442,34 @@ describe("decision-wait", () => {
     expect(readFileSync(seen, "utf8")).toBe("interaction:ix-old:2026-10-31T12:00:00.000Z\n");
   });
 
+  it.each([true, false])("reconfirms an identical prior-snapshot hint during a later read (reopened=%s)", async (reopened) => {
+    const old = decision("approval", "ap-old");
+    const trigger = decision("approval", "ap-trigger");
+    const seen = tmpFile();
+    writeFileSync(seen, "approval:ap-old:2026-10-31T12:00:00.000Z\napproval:ap-trigger:2026-10-31T12:00:00.000Z\n");
+    const fake = await fakePaperclip({
+      pending: [], pendingByCall: [[old], [], reopened ? [old] : []],
+      replay: false, catchUpDelayMs: 100,
+      onCatchUp: (call, stream) => {
+        if (call === 1) {
+          // The previous snapshot confirmed old, but this read captured its
+          // absence before an identical reopening (or delayed replay) arrives.
+          stream?.write(`data: ${JSON.stringify(old)}\n\n`);
+          setTimeout(() => stream?.write("event: close\ndata: {}\n\n"), 500);
+        }
+      },
+    });
+    const running = run(fake.url, seen, TOKEN, {}, 3000);
+    await vi.waitFor(() => expect(readFileSync(seen, "utf8")).toBe("approval:ap-old:2026-10-31T12:00:00.000Z\n"));
+    fake.sendDecision(trigger);
+    const result = await running;
+    expect(fake.catchUps.count).toBe(3);
+    expect(result.code).toBe(reopened ? 0 : 1);
+    expect(result.stdout).toBe(reopened ? `${JSON.stringify(old)}\n` : "");
+    expect(result.stderr).toBe(reopened ? "" : "decision-wait: stream closed by the plugin worker\n");
+    expect(readFileSync(seen, "utf8")).toBe(reopened ? "approval:ap-old:2026-10-31T12:00:00.000Z\n" : "");
+  });
+
   it("suppresses a delayed previously-seen live audience update that is no longer pending", async () => {
     const old = decision("interaction", "ix-old", { audience: "operator" });
     const fake = await fakePaperclip({

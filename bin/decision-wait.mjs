@@ -238,6 +238,8 @@ async function refreshStream() {
       // This read is requested after all currently queued hints. Hints arriving
       // during it need another read unless its snapshot confirms their payload.
       oldHints.clear();
+      // A prior snapshot cannot confirm hints arriving during a newer read.
+      confirmedPending.clear();
       const pending = await catchUp();
       if (!announcing) pending.some(announce);
       // Confirm excluded work without marking it seen. Keep the payload so a
