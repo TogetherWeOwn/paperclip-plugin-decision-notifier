@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (unreleased)
 
-(nothing yet)
+- The waiter now defaults to the authenticated board user's native attention desk rather than the company-wide plugin stream. It emits `issue_thread_interaction`, `approval` and `decision` hints and respects personal dismissals/snoozes and company triage snoozes. Native mode requires the attention/session/inbox APIs available in Paperclip 2026.1106.0; `--source plugin` retains the prior stream/poll behavior for older hosts.
+- Still-pending native items become eligible again after a 30-minute reminder interval, with `reminder` and `ageMs`. Timestamped, actor-scoped delivery records survive restarts; old bare seen keys are eligible immediately. Desk-page absence never prunes the ledger.
+- Native reads have bounded pages, bytes and deadlines; no plugin catch-up scan is invoked. This does not recover collapsed siblings or prove full backlog completeness, and the optional blocker/failed-run digest is not included. Plugin advisory audience/origin filters apply only to plugin-provided hints; native items carry no such classification and pass those filters as unknown. Consumers must re-read native authority before acting.
 
 ## 0.3.6
 

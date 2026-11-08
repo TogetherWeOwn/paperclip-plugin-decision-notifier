@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// Block until the decision stream announces a decision (or a failed-run group)
+// By default, wait on the authenticated user's native attention desk with interval
+// reminders and snooze/dismissal filtering (attention-wait.mjs).
+// With --source plugin, block until the decision stream announces a decision (or a failed-run group)
 // this client has not seen, print it as one JSON line, and exit 0. Exit 1 on stream or
 // auth failure, or after bounded catch-up retries, so the caller re-arms instead of hanging.
 // If the host answers the stream with HTTP 501 (no plugin stream bus, as in
@@ -49,6 +51,7 @@ const { values: args } = parseArgs({
     api: { type: "string" },
     audience: { type: "string" },
     "exclude-origin-kind": { type: "string" },
+    source: { type: "string", default: "attention" },
   },
 });
 
@@ -81,6 +84,15 @@ if (!args.company) fail("--company is required");
 if (!tokenFile) fail("set PAPERCLIP_BOARD_TOKEN_FILE");
 const token = readFileSync(tokenFile, "utf8").trim();
 if (!token) fail("token file is empty");
+
+if (!["attention", "plugin"].includes(args.source)) fail("--source must be attention or plugin");
+if (args.source === "attention") {
+  const { waitForAttention } = await import("./attention-wait.mjs");
+  await waitForAttention({ apiBase, token, companyId: args.company, seenFile: args.seen,
+    timeoutMs: delayFromEnv("PAPERCLIP_DECISION_WAIT_TIMEOUT_MS", 30_000), pollMs: POLL_INTERVAL_MS,
+    reminderMs: delayFromEnv("PAPERCLIP_DECISION_WAIT_REMINDER_MS", 30 * 60_000) }).catch((err) => fail(err.message));
+  process.exit(0);
+}
 
 const headers = { Authorization: `Bearer ${token}` };
 const plugin = encodeURIComponent(args.plugin);
