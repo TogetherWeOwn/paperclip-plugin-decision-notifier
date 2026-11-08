@@ -239,7 +239,9 @@ async function refreshStream() {
       oldHints.clear();
       const pending = await catchUp();
       if (!announcing) pending.some(announce);
-      for (const key of oldHints) if (seen.has(key)) oldHints.delete(key);
+      // Snapshot presence confirms a hint even when routing excludes it. Do
+      // not mark excluded decisions seen, or treat their replay as new work.
+      for (const decision of pending) oldHints.delete(seenKey(decision));
     } while (!announcing && oldHints.size > 0);
   } catch (err) {
     if (!announcing) fail(err.message);

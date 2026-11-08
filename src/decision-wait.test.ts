@@ -369,6 +369,44 @@ describe("decision-wait", () => {
     expect(readFileSync(seen, "utf8")).toBe("approval:ap-old:2026-10-31T12:00:00.000Z\n");
   });
 
+  it.each([
+    { filter: "audience", argv: ["--audience", "owner"], extra: { audience: "board" } },
+    { filter: "origin", argv: ["--exclude-origin-kind", "council"], extra: { originKind: "council" } },
+  ])("retires a confirmed reopened hint excluded by $filter without marking it seen", async ({ argv, extra }) => {
+    const old = decision("approval", "ap-old", extra);
+    const eligible = decision("interaction", "ix-live", { audience: "owner" });
+    const seen = tmpFile();
+    writeFileSync(seen, "approval:ap-old:2026-10-31T12:00:00.000Z\n");
+    const idle: { count: number; seen: string }[] = [];
+    let pruned: string | undefined;
+    const fake = await fakePaperclip({
+      pending: [], pendingByCall: [[], [old]], catchUpDelayMs: 40,
+      onCatchUp: (call, stream) => {
+        if (call === 0) setTimeout(() => {
+          pruned = readFileSync(seen, "utf8");
+          stream?.write(`data: ${JSON.stringify(old)}\n\n`);
+        }, 100);
+        if (call === 1) {
+          // Replays precede each successful HTTP response. Observe two quiet
+          // windows with no independent event before delivering eligible work.
+          setTimeout(() => idle.push({ count: fake.catchUps.count, seen: readFileSync(seen, "utf8") }), 200);
+          setTimeout(() => {
+            idle.push({ count: fake.catchUps.count, seen: readFileSync(seen, "utf8") });
+            stream?.write(`data: ${JSON.stringify(eligible)}\n\n`);
+          }, 350);
+        }
+      },
+    });
+    const result = await run(fake.url, seen, TOKEN, {}, 3000, argv);
+    expect(pruned).toBe("");
+    expect(idle).toEqual([{ count: 2, seen: "" }, { count: 2, seen: "" }]);
+    expect(fake.catchUps.count).toBe(2);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual(eligible);
+    expect(readFileSync(seen, "utf8")).toBe("interaction:ix-live:2026-10-31T12:00:00.000Z\n");
+  });
+
   it("suppresses a delayed previously-seen live audience update that is no longer pending", async () => {
     const old = decision("interaction", "ix-old", { audience: "operator" });
     const fake = await fakePaperclip({
