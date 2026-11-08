@@ -229,13 +229,24 @@ export function isInvocationScopeDenial(err: unknown): boolean {
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);
   let next = 0;
+  let failed = false;
+  let failure: unknown;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
+    while (!failed && next < items.length) {
       const index = next++;
-      out[index] = await fn(items[index]);
+      try {
+        out[index] = await fn(items[index]);
+      } catch (err) {
+        if (!failed) {
+          failed = true;
+          failure = err;
+        }
+      }
     }
   });
+  // Keep the caller's lock until every in-flight read stops, even after a failure.
   await Promise.all(workers);
+  if (failed) throw failure;
   return out;
 }
 
@@ -544,7 +555,7 @@ export class DecisionNotifier {
         : [];
       return [...decisions, ...failures];
     });
-    for (const event of pending) this.emitEvent(companyId, event);
+    for (const event of pending) this.emitEvent(companyId, event, true);
     this.ctx.logger.info("decision catch-up completed", {
       companyId,
       durationMs: Math.round(performance.now() - startedAt),
@@ -1108,7 +1119,7 @@ export class DecisionNotifier {
     this.emitEvent(companyId, toEvent(decision));
   }
 
-  private emitEvent(companyId: string, event: NotifierEvent): void {
+  private emitEvent(companyId: string, event: NotifierEvent, replay = false): void {
     // emit() has no company argument: the worker routes it to the company the
     // channel was last opened for. Open only on a company change, so a client
     // sees a single `open` event rather than one per decision.
@@ -1116,7 +1127,9 @@ export class DecisionNotifier {
       this.ctx.streams.open(STREAM_CHANNEL, companyId);
       this.openedCompanyId = companyId;
     }
-    this.ctx.streams.emit(STREAM_CHANNEL, toPublic(event));
+    const payload = toPublic(event);
+    // Stream-only metadata: snapshots and stored events keep their public shape.
+    this.ctx.streams.emit(STREAM_CHANNEL, replay ? { ...payload, replay: true } : payload);
   }
 
   private async load(companyId: string): Promise<PendingMap> {

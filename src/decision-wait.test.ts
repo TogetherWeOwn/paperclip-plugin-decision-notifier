@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Readable } from "node:stream";
 
 const SCRIPT = fileURLToPath(new URL("../bin/decision-wait.mjs", import.meta.url));
 const TOKEN = "board-token-123";
@@ -29,6 +30,8 @@ interface FakeOptions {
   pending: object[];
   /** Frames sent after the replay, as raw SSE text. */
   later?: string[];
+  /** Emit catch-up replay frames (false exercises HTTP-only selection). */
+  replay?: boolean;
   /** End the stream right after the later frames. */
   endAfterLater?: boolean;
   /** Send the later frames this long after catch-up instead of at once, leaving the stream idle. */
@@ -113,7 +116,9 @@ async function fakePaperclip(options: FakeOptions) {
         const pending = calls ? calls[Math.min(call, calls.length - 1)] : options.pending;
         // Like the worker: replay onto the stream first, then answer.
         stream?.write(`event: open\ndata: {"type":"open"}\n\n`);
-        for (const event of pending) stream?.write(`data: ${JSON.stringify(event)}\n\n`);
+        if (options.replay !== false) {
+          for (const event of pending) stream?.write(`data: ${JSON.stringify({ ...event, replay: true })}\n\n`);
+        }
         const sendLater = () => {
           for (const frame of options.later ?? []) stream?.write(frame);
           if (options.endAfterLater) setTimeout(() => stream?.end(), 50);
@@ -130,7 +135,13 @@ async function fakePaperclip(options: FakeOptions) {
   await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : 0;
-  return { url: `http://127.0.0.1:${port}`, seenAuth, catchUps };
+  return {
+    url: `http://127.0.0.1:${port}`, seenAuth, catchUps,
+    breakStream: (mode: "close" | "reset") => {
+      if (mode === "close") stream?.write("event: close\ndata: {}\n\n");
+      else stream?.socket?.resetAndDestroy();
+    },
+  };
 }
 
 function run(
@@ -140,19 +151,25 @@ function run(
   extraEnv: Record<string, string> = {},
   killAfterMs = 5000,
   extraArgv: string[] = [],
+  beforeReadStdout?: (stdout: Readable) => Promise<void>,
 ) {
   const dir = mkdtempSync(join(tmpdir(), "dw-"));
   const tokenFile = join(dir, "token");
   writeFileSync(tokenFile, `${token}\n`);
-  return spawnScript(["--company", "c-1", "--seen", seenFile, ...extraArgv], { PAPERCLIP_API_URL: `${apiUrl}/api`, PAPERCLIP_BOARD_TOKEN_FILE: tokenFile, ...extraEnv }, killAfterMs);
+  return spawnScript(["--company", "c-1", "--seen", seenFile, ...extraArgv], { PAPERCLIP_API_URL: `${apiUrl}/api`, PAPERCLIP_BOARD_TOKEN_FILE: tokenFile, ...extraEnv }, killAfterMs, beforeReadStdout);
 }
 
-function spawnScript(argv: string[], env: Record<string, string>, killAfterMs = 5000) {
+function spawnScript(argv: string[], env: Record<string, string>, killAfterMs = 5000, beforeReadStdout?: (stdout: Readable) => Promise<void>) {
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
     const child = spawn(process.execPath, [SCRIPT, ...argv], { env: { PATH: process.env.PATH, ...env } });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (c) => (stdout += c));
+    const readStdout = () => child.stdout.on("data", (c) => (stdout += c));
+    if (beforeReadStdout) {
+      // Leave the pipe unread until a large announcement has filled it. Only
+      // then break SSE, so the stdout callback cannot have completed first.
+      child.stdout.once("readable", () => void beforeReadStdout(child.stdout).then(readStdout));
+    } else readStdout();
     child.stderr.on("data", (c) => (stderr += c));
     const timer = setTimeout(() => child.kill(), killAfterMs);
     child.on("close", (code) => {
@@ -291,7 +308,7 @@ describe("decision-wait", () => {
   });
 
   it("keeps startup dedupe after a failed replay and a successful snapshot prunes disk", async () => {
-    const old = decision("approval", "ap-old");
+    const old = { ...decision("approval", "ap-old"), replay: true };
     const fake = await fakePaperclip({
       pending: [], catchUpByCall: [502, 200],
       onCatchUp: (call, stream) => {
@@ -309,6 +326,69 @@ describe("decision-wait", () => {
     expect(JSON.parse(result.stdout).id).toBe("ix-new");
     expect(fake.catchUps.count).toBe(2);
     expect(readFileSync(seen, "utf8")).toBe("interaction:ix-new:2026-10-31T12:00:00.000Z\n");
+  });
+
+  it("announces a reopened approval on the same stream after an empty snapshot", async () => {
+    const old = decision("approval", "ap-old");
+    const fake = await fakePaperclip({
+      pending: [], catchUpByCall: [502, 200],
+      onCatchUp: (call, stream) => {
+        if (call === 0) stream?.write(`data: ${JSON.stringify({ ...old, replay: true })}\n\n`);
+      },
+      later: [`data: ${JSON.stringify(old)}\n\n`], laterDelayMs: 100, endAfterLater: true,
+    });
+    const seen = tmpFile();
+    writeFileSync(seen, "approval:ap-old:2026-10-31T12:00:00.000Z\n");
+    const result = await run(fake.url, seen);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(old);
+    expect(fake.catchUps.count).toBe(2);
+    expect(readFileSync(seen, "utf8")).toBe("approval:ap-old:2026-10-31T12:00:00.000Z\n");
+  });
+
+  it.each([undefined, null, 7, "", "not-a-date"])("rejects snapshot createdAt=%s without pruning or announcing", async (createdAt) => {
+    const fake = await fakePaperclip({
+      pending: [],
+      catchUpByCall: [{ body: JSON.stringify({ pending: [decision("approval", "ap-1", { createdAt })] }) }],
+    });
+    const seen = tmpFile();
+    const before = "approval:ap-1:2026-10-31T12:00:00.000Z\n";
+    writeFileSync(seen, before);
+    const result = await run(fake.url, seen);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("decision-wait: catch-up failed: invalid pending snapshot\n");
+    expect(readFileSync(seen, "utf8")).toBe(before);
+    expect(fake.catchUps.count).toBe(1);
+  });
+
+  it.each(["close", "reset"] as const)("finishes an HTTP-selected announcement under backpressure after stream %s", async (mode) => {
+    const selected = decision("approval", "ap-http", { url: "x".repeat(2 * 1024 * 1024) });
+    const fake = await fakePaperclip({ pending: [selected], replay: false });
+    const seen = tmpFile();
+    const result = await run(fake.url, seen, TOKEN, {}, 5000, [], async () => {
+      fake.breakStream(mode);
+      // The unread stdout pipe holds the announcement while the close/error is handled.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual(selected);
+    expect(readFileSync(seen, "utf8")).toBe("approval:ap-http:2026-10-31T12:00:00.000Z\n");
+  });
+
+  it("still fails a broken stdout pipe after deferring stream close", async () => {
+    const selected = decision("approval", "ap-http", { url: "x".repeat(2 * 1024 * 1024) });
+    const fake = await fakePaperclip({ pending: [selected], replay: false });
+    const seen = tmpFile();
+    const result = await run(fake.url, seen, TOKEN, {}, 5000, [], async (stdout) => {
+      fake.breakStream("close");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      stdout.destroy();
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/^decision-wait: stdout write failed: .+\n$/);
+    expect(readFileSync(seen, "utf8")).toBe("");
   });
 
   it("recovers when catch-up response headers time out", async () => {

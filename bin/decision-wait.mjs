@@ -89,6 +89,9 @@ const company = encodeURIComponent(args.company);
 const readSeen = () =>
   args.seen && existsSync(args.seen) ? new Set(readFileSync(args.seen, "utf8").split("\n").filter(Boolean)) : new Set();
 const seen = readSeen();
+// Catch-up replay frames can arrive after a newer snapshot prunes disk. Their
+// explicit wire marker distinguishes them from a genuinely reopened live item.
+const startupSeen = new Set(seen);
 
 /** Accept only the documented shape; anything else on the wire is ignored. */
 function parseDecision(data) {
@@ -204,21 +207,20 @@ async function fetchCatchUp() {
   }
 }
 
-async function catchUp({ pruneMemory = true } = {}) {
+async function catchUp() {
   const body = await fetchCatchUp();
   if (!Array.isArray(body?.pending)) throw new Error("catch-up failed: invalid pending snapshot");
   const pending = body.pending.map((e) => parseDecision(JSON.stringify(e)));
   // A missing or malformed snapshot is not evidence that a seen decision was resolved.
-  if (pending.some((event) => event === null)) throw new Error("catch-up failed: invalid pending snapshot");
+  if (pending.some((event) => !event || !event.id || !event.url || !event.createdAt || !Number.isFinite(Date.parse(event.createdAt)))) {
+    throw new Error("catch-up failed: invalid pending snapshot");
+  }
   if (args.seen && !announcing) {
     // Forget decisions that were resolved, so they announce again if they come back.
     const pendingKeys = new Set(pending.map(seenKey));
     const kept = [...readSeen()].filter((key) => pendingKeys.has(key));
     writeFileSync(args.seen, kept.length ? `${kept.join("\n")}\n` : "");
-    // SSE replays from a failed attempt may still be in transit when a later
-    // snapshot resolves that item. Keep startup dedupe for this connection;
-    // disk pruning still lets a future invocation announce a new pending cycle.
-    if (pruneMemory) for (const key of seen) if (!pendingKeys.has(key)) seen.delete(key);
+    for (const key of seen) if (!pendingKeys.has(key)) seen.delete(key);
   }
   return pending;
 }
@@ -257,16 +259,24 @@ async function drainFrames() {
       clearTimeout(firstFrameTimer);
       // Catch-up may need retries, but a healthy stream must keep delivering
       // live decisions and close frames while that request is in flight.
-      void catchUp({ pruneMemory: false }).then((pending) => {
+      void catchUp().then((pending) => {
         if (!announcing) pending.some(announce);
       }).catch((err) => {
         if (!announcing) fail(err.message);
       });
     }
-    if (type === "close") fail("stream closed by the plugin worker");
+    if (type === "close") {
+      if (!announcing) fail("stream closed by the plugin worker");
+      return true;
+    }
     if (type !== "message" || data.length === 0) continue;
-    const decision = parseDecision(data.join("\n"));
-    if (decision && announce(decision)) return true;
+    const payload = data.join("\n");
+    const decision = parseDecision(payload);
+    if (!decision) continue;
+    // Only replay frames retain startup dedupe after pruning. Live approvals
+    // can reopen with the same original createdAt and must be allowed through.
+    if (JSON.parse(payload).replay === true && startupSeen.has(seenKey(decision))) continue;
+    if (announce(decision)) return true;
   }
   return false;
 }
@@ -330,5 +340,7 @@ if (status === 501) {
 } else {
   if (status < 200 || status > 299) fail(`stream failed: HTTP ${status}`);
   firstFrameTimer = setTimeout(() => fail("stream failed: no frame after the headers"), REQUEST_TIMEOUT_MS);
-  await readStream(response).catch((err) => fail(`stream failed: ${err.message}`));
+  await readStream(response).catch((err) => {
+    if (!announcing) fail(`stream failed: ${err.message}`);
+  });
 }
