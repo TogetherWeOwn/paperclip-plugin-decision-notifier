@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as crypto from "node:crypto";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 vi.mock("node:fs", async (importOriginal) => ({ ...await importOriginal<typeof import("node:fs")>() }));
+vi.mock("node:crypto", async (importOriginal) => ({ ...await importOriginal<typeof import("node:crypto")>() }));
 
 const modulePath = new URL("../bin/attention-state.mjs", import.meta.url).href;
 const { deliveryState } = await import(modulePath);
@@ -113,6 +115,23 @@ describe("actor delivery ledger", () => {
     expect(readFileSync(target, "utf8")).toBe("untouched");
     expect(statSync(file).isFile()).toBe(true);
     expect(readdirSync(join(file, ".."))).toHaveLength(3);
+  });
+
+  it("refuses a symlink at the exact generated temporary path without touching its target", () => {
+    const file = ledger(); const target = `${file}-target`;
+    const uuid = "00000000-0000-4000-8000-000000000000";
+    const random = vi.spyOn(crypto, "randomUUID").mockReturnValue(uuid);
+    try {
+      writeFileSync(target, "untouched");
+      const planted = `${file}.${process.pid}.${uuid}.tmp`;
+      symlinkSync(target, planted);
+      expect(() => deliveryState(file, "actor").delivered("ask", Date.now())).toThrow();
+      expect(readFileSync(target, "utf8")).toBe("untouched");
+      expect(fs.lstatSync(planted).isSymbolicLink()).toBe(true);
+      expect(fs.existsSync(file)).toBe(false);
+    } finally {
+      random.mockRestore();
+    }
   });
 
   it("caps retained delivery records and retires timestamps older than thirty days", () => {

@@ -32,21 +32,23 @@ function dismissal(extra: Record<string, unknown> = {}) {
 async function fake(options: {
   pages?: object[][]; itemsByCall?: object[][]; rows?: object[]; rowsStatus?: number;
   feed?: unknown; identity?: unknown; attentionStatus?: number; stallRows?: boolean;
-  redirect?: boolean; repeatedCursor?: boolean;
+  redirect?: boolean; repeatedCursor?: boolean; pageDelayMs?: number; rowsDelayMs?: number;
 } = {}) {
   const requests: string[] = [];
   let calls = 0;
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
     requests.push(req.url!);
     if (req.headers.authorization !== `Bearer ${TOKEN}`) { res.writeHead(403).end(); return; }
     res.setHeader("Content-Type", "application/json");
     if (req.url === "/api/auth/get-session") { res.end(JSON.stringify(options.identity ?? { session: { userId: "operator" } })); return; }
     if (req.url === "/api/companies/c-1/inbox-dismissals") {
       if (options.stallRows) return;
+      if (options.rowsDelayMs) await new Promise((resolve) => setTimeout(resolve, options.rowsDelayMs));
       if (options.rowsStatus) { res.writeHead(options.rowsStatus).end(JSON.stringify({ secret: TOKEN })); return; }
       res.end(JSON.stringify(options.rows ?? [])); return;
     }
     if (req.url?.startsWith("/api/companies/c-1/attention?")) {
+      if (options.pageDelayMs) await new Promise((resolve) => setTimeout(resolve, options.pageDelayMs));
       if (options.redirect) { res.writeHead(302, { Location: "/leak" }).end(); return; }
       if (options.attentionStatus) { res.writeHead(options.attentionStatus).end(JSON.stringify({ secret: TOKEN })); return; }
       const query = new URL(req.url, "http://test.invalid").searchParams;
@@ -202,8 +204,9 @@ describe("native actor attention waiter", () => {
     const decision = item("d-1", { sourceKind: "decision", expiresAt,
       subject: { id: "d-1", companyId: "c-1", status: "open", href: "/TEST/decisions?decisionId=d-1" } });
     const api = await fake({ itemsByCall: [[decision]] }); const paths = files();
-    // Even an already delivered decision must not be reminded after expiry.
-    writeFileSync(paths.seen, `decision:d-1:${createdAt}\n`);
+    // Decisions were not part of the legacy plugin ledger; seed a native delivery.
+    const scope = JSON.stringify([api.url, "c-1", "operator"]);
+    writeFileSync(paths.seen, JSON.stringify({ version: 1, scope, key: `decision:d-1:${createdAt}`, deliveredAt: Date.now() - 31 * 60_000 }) + "\n");
     const result = await run(api.url, paths, {}, deliver ? 3000 : 350);
     if (deliver) {
       expect(result.code).toBe(0); expect(JSON.parse(result.stdout)).toMatchObject({ kind: "decision", reminder: true });
@@ -281,6 +284,15 @@ describe("native actor attention waiter", () => {
     expect(result.code).toBe(1); expect(result.stdout).toBe("");
     expect(result.stderr).not.toContain(TOKEN);
     expect(api.requests).not.toContain("/leak");
+  });
+
+  it("shares one deadline across attention pages and the suppression read", async () => {
+    const api = await fake({ pages: [[], [item()]], pageDelayMs: 200, rowsDelayMs: 600 });
+    const result = await run(api.url, files(), { PAPERCLIP_DECISION_WAIT_TIMEOUT_MS: "800" });
+    expect(api.requests.filter((path) => path.includes("/attention?"))).toHaveLength(2);
+    expect(api.requests).toContain("/api/companies/c-1/inbox-dismissals");
+    expect(result.code).toBe(1); expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("timed out");
   });
 
   it("times out a stalled suppression read without delivering an item", async () => {
