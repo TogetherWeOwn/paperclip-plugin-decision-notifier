@@ -1,17 +1,43 @@
-import { closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
 const MAX_BYTES = 4 * 1024 * 1024;
 const MAX_RECORDS = 10_000;
 const RETENTION_MS = 30 * 24 * 60 * 60_000;
 
+function readLedger(file) {
+  let descriptor;
+  try {
+    // Do not block opening a FIFO or follow a substituted final-path symlink.
+    descriptor = openSync(file, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  }
+  try {
+    const info = fstatSync(descriptor);
+    if (!info.isFile()) throw new Error("seen ledger must be a regular file");
+    if (info.size > MAX_BYTES) throw new Error("seen ledger exceeds 4 MiB");
+    // Size can change after fstat. Read at most the cap plus one overflow byte.
+    const buffer = Buffer.alloc(MAX_BYTES + 1);
+    let bytes = 0;
+    while (bytes < buffer.length) {
+      const count = readSync(descriptor, buffer, bytes, buffer.length - bytes, null);
+      if (!count) return buffer.toString("utf8", 0, bytes);
+      bytes += count;
+      if (bytes > MAX_BYTES) throw new Error("seen ledger exceeds 4 MiB");
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 /** A capped delivery ledger, never an acknowledgement or a complete pending set. */
 export function deliveryState(file, scope) {
   const records = new Map();
   const legacy = new Set();
-  if (file && existsSync(file)) {
-    if (statSync(file).size > MAX_BYTES) throw new Error("seen ledger exceeds 4 MiB");
-    for (const line of readFileSync(file, "utf8").split("\n")) {
+  if (file) {
+    for (const line of readLedger(file).split("\n")) {
       if (!line) continue;
       try {
         const record = JSON.parse(line);

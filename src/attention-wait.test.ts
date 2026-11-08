@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -100,6 +100,26 @@ describe("native actor attention waiter", () => {
     expect(api.requests.some((path) => path.includes("plugins"))).toBe(false);
   });
 
+  it("records delivery time only after stdout accepts the notification", async () => {
+    const modulePath = new URL("../bin/attention-wait.mjs", import.meta.url).href;
+    const { waitForAttention } = await import(modulePath);
+    const api = await fake(); const paths = files();
+    const start = Date.now(); const acceptedAt = start + 60_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    const output = vi.spyOn(process.stdout, "write").mockImplementation((...args) => {
+      clock.mockReturnValue(acceptedAt);
+      const callback = args[args.length - 1] as (error?: Error | null) => void;
+      callback();
+      return true;
+    });
+    try {
+      await waitForAttention({ apiBase: api.url, token: TOKEN, companyId: "c-1", seenFile: paths.seen, timeoutMs: 3000, pollMs: 20, reminderMs: 400 });
+      expect(JSON.parse(readFileSync(paths.seen, "utf8").trim()).deliveredAt).toBe(acceptedAt);
+    } finally {
+      output.mockRestore(); clock.mockRestore();
+    }
+  });
+
   it("prioritizes unseen asks over due reminders and then the oldest reminder delivery", async () => {
     const api = await fake({ itemsByCall: [[item("A"), item("B")]] }); const paths = files();
     writeFileSync(paths.seen, `interaction:A:${createdAt}\n`);
@@ -152,6 +172,55 @@ describe("native actor attention waiter", () => {
     expect((await run(stale.url, files())).code).toBe(0);
   });
 
+  it.each([
+    ["ordinary inbox dismissal", "approval:a-1", "dismiss", "2030-01-01T00:00:00Z", false],
+    ["ordinary inbox snooze", "approval:a-1", "snooze", "2030-01-01T00:00:00Z", false],
+    ["desk dismissal", "attention:approval:a-1", "dismiss", "2030-01-01T00:00:00Z", false],
+    ["desk snooze", "attention:approval:a-1", "snooze", "2030-01-01T00:00:00Z", false],
+    ["expired ordinary snooze", "approval:a-1", "snooze", "2020-01-01T00:00:00Z", true],
+    ["new activity after ordinary dismissal", "approval:a-1", "dismiss", "2020-01-01T00:00:00Z", true],
+    ["another approval's dismissal", "approval:other", "dismiss", "2030-01-01T00:00:00Z", true],
+  ])("honors approval suppression semantics: %s", async (_name, itemKey, kind, deadline, deliver) => {
+    const approval = item("a-1", { sourceKind: "approval", dismissalKey: "attention:approval:a-1",
+      subject: { id: "a-1", companyId: "c-1", status: "pending", href: "/TEST/approvals/a-1" } });
+    const api = await fake({ itemsByCall: [[approval]], rows: [dismissal({ itemKey, kind, dismissedAt: kind === "snooze" ? "2020-01-01T00:00:00Z" : deadline, snoozedUntil: kind === "snooze" ? deadline : null })] });
+    const result = await run(api.url, files(), {}, deliver ? 3000 : 350);
+    if (deliver) {
+      expect(result.code).toBe(0); expect(JSON.parse(result.stdout)).toMatchObject({ kind: "approval", id: "a-1" });
+    } else {
+      expect(result.stdout).toBe(""); expect(result.code).toBeNull();
+      expect(api.requests).toContain("/api/companies/c-1/inbox-dismissals");
+    }
+  });
+
+  it.each([
+    ["elapsed", "2020-01-01T00:00:00Z", false],
+    ["future", "2030-01-01T00:00:00Z", true],
+    ["absent", undefined, true],
+    ["null", null, true],
+  ])("only delivers unexpired open decisions: %s expiry", async (_name, expiresAt, deliver) => {
+    const decision = item("d-1", { sourceKind: "decision", expiresAt,
+      subject: { id: "d-1", companyId: "c-1", status: "open", href: "/TEST/decisions?decisionId=d-1" } });
+    const api = await fake({ itemsByCall: [[decision]] }); const paths = files();
+    // Even an already delivered decision must not be reminded after expiry.
+    writeFileSync(paths.seen, `decision:d-1:${createdAt}\n`);
+    const result = await run(api.url, paths, {}, deliver ? 3000 : 350);
+    if (deliver) {
+      expect(result.code).toBe(0); expect(JSON.parse(result.stdout)).toMatchObject({ kind: "decision", reminder: true });
+    } else {
+      expect(result.stdout).toBe(""); expect(result.code).toBeNull();
+      expect(api.requests).toContain("/api/companies/c-1/inbox-dismissals");
+    }
+  });
+
+  it("fails closed on a malformed decision expiry", async () => {
+    const api = await fake({ itemsByCall: [[item("d-1", { sourceKind: "decision", expiresAt: "not-a-date",
+      subject: { id: "d-1", companyId: "c-1", status: "open", href: "/TEST/decisions" } })]] });
+    const result = await run(api.url, files());
+    expect(result.code).toBe(1); expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("invalid decision expiry");
+  });
+
   it("migrates an old permanently-seen interaction into an immediate reminder", async () => {
     const api = await fake(); const paths = files();
     writeFileSync(paths.seen, `interaction:ask:${createdAt}\n`);
@@ -192,6 +261,11 @@ describe("native actor attention waiter", () => {
     const result = await run(capped.url, files(), { PAPERCLIP_DECISION_WAIT_POLL_MS: "60000" }, 350);
     expect(result.stdout).toBe(""); expect(result.stderr).toContain("coverage is partial");
     expect(capped.requests.filter((path) => path.includes("/attention?"))).toHaveLength(5);
+    const partial = await fake({ pages: [[], [], [], [], [item()], []] });
+    const delivered = await run(partial.url, files());
+    expect(delivered.code).toBe(0); expect(JSON.parse(delivered.stdout).id).toBe("ask");
+    expect(delivered.stderr).toContain("coverage is partial");
+    expect(partial.requests.filter((path) => path.includes("/attention?"))).toHaveLength(5);
   });
 
   it.each([

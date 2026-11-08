@@ -1,7 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { execFileSync, spawnSync } from "node:child_process";
+import * as fs from "node:fs";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+vi.mock("node:fs", async (importOriginal) => ({ ...await importOriginal<typeof import("node:fs")>() }));
 
 const modulePath = new URL("../bin/attention-state.mjs", import.meta.url).href;
 const { deliveryState } = await import(modulePath);
@@ -49,6 +53,45 @@ describe("actor delivery ledger", () => {
     expect(deliveryState(file, "actor").previous("bad")).toBeNull();
     writeFileSync(file, "x".repeat(4 * 1024 * 1024 + 1));
     expect(() => deliveryState(file, "actor")).toThrow("seen ledger exceeds 4 MiB");
+  });
+
+  it("bounds actual reads even when the file exceeds its descriptor's initial size", () => {
+    const file = ledger(); const limit = 4 * 1024 * 1024;
+    writeFileSync(file, "x".repeat(limit + 1024));
+    const initialStat = statSync(file);
+    const metadata = vi.spyOn(fs, "fstatSync").mockReturnValueOnce(Object.assign(initialStat, { size: 0 }));
+    const reads = vi.spyOn(fs, "readSync"); const closes = vi.spyOn(fs, "closeSync");
+    try {
+      expect(() => deliveryState(file, "actor")).toThrow("seen ledger exceeds 4 MiB");
+      const bytes = reads.mock.results.reduce((total, result) => total + (result.type === "return" ? Number(result.value) : 0), 0);
+      expect(bytes).toBe(limit + 1);
+      expect(closes).toHaveBeenCalledTimes(1);
+    } finally {
+      metadata.mockRestore(); reads.mockRestore(); closes.mockRestore();
+    }
+  });
+
+  it("accepts a regular ledger exactly at the byte cap", () => {
+    const file = ledger(); const limit = 4 * 1024 * 1024;
+    const record = JSON.stringify({ version: 1, scope: "actor", key: "ask", deliveredAt: 123 });
+    writeFileSync(file, `${record}\n${" ".repeat(limit - Buffer.byteLength(record) - 1)}`);
+    expect(deliveryState(file, "actor").previous("ask")).toBe(123);
+  });
+
+  it("refuses symlinks and non-regular ledger inputs without blocking", () => {
+    const file = ledger(); const target = `${file}-target`;
+    writeFileSync(target, "untouched"); symlinkSync(target, file);
+    expect(() => deliveryState(file, "actor")).toThrow();
+    expect(readFileSync(target, "utf8")).toBe("untouched");
+    expect(() => deliveryState(join(file, ".."), "actor")).toThrow("seen ledger must be a regular file");
+    const fifo = `${file}-fifo`;
+    execFileSync("mkfifo", [fifo]);
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", `
+      import { deliveryState } from ${JSON.stringify(modulePath)};
+      try { deliveryState(process.argv[1], "actor"); process.exitCode = 2; }
+      catch (error) { if (error.message !== "seen ledger must be a regular file") throw error; }
+    `, fifo], { timeout: 3000, encoding: "utf8" });
+    expect(result.error).toBeUndefined(); expect(result.status).toBe(0);
   });
 
   it("keeps serialized output within its own read budget", () => {

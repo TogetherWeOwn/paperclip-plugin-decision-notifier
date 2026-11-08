@@ -89,8 +89,17 @@ export async function waitForAttention({ apiBase, token, companyId, seenFile, ti
       if (item.sourceKind === "issue_thread_interaction" && audience?.addresseeUserId && audience.addresseeUserId !== userId) continue;
       if (item.snoozedUntil != null && !timestamp(item.snoozedUntil)) throw new Error("invalid attention snooze");
       if (Date.parse(item.snoozedUntil) > now || item.dismissal?.isActive === true) continue;
-      const dismissal = dismissals.get(item.dismissalKey);
-      if (dismissal && (dismissal.kind === "snooze" ? Date.parse(dismissal.snoozedUntil) > now : Date.parse(dismissal.dismissedAt) >= Date.parse(item.activityAt))) continue;
+      if (item.sourceKind === "decision" && item.expiresAt != null) {
+        if (!timestamp(item.expiresAt)) throw new Error("invalid decision expiry");
+        if (Date.parse(item.expiresAt) <= now) continue;
+      }
+      // Approvals can also be suppressed from the ordinary inbox, under its own key.
+      const keys = [item.dismissalKey];
+      if (item.sourceKind === "approval") keys.push(`approval:${subject.id}`);
+      if (keys.some((key) => {
+        const dismissal = dismissals.get(key);
+        return dismissal && (dismissal.kind === "snooze" ? Date.parse(dismissal.snoozedUntil) > now : Date.parse(dismissal.dismissedAt) >= Date.parse(item.activityAt));
+      })) continue;
       const legacyKind = item.sourceKind === "issue_thread_interaction" ? "interaction" : item.sourceKind;
       const key = `${legacyKind}:${subject.id}:${item.createdAt}`;
       const previous = state.previous(key);
@@ -119,7 +128,7 @@ export async function waitForAttention({ apiBase, token, companyId, seenFile, ti
     if (next) {
       // Native attention has no plugin audience/origin hints. Unknown hints pass the old advisory filters.
       await new Promise((resolve, reject) => process.stdout.write(`${JSON.stringify(next.event)}\n`, (err) => err ? reject(err) : resolve()));
-      state.delivered(next.key, now);
+      state.delivered(next.key, Date.now());
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, pollMs));
