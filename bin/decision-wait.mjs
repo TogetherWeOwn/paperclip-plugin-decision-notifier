@@ -158,11 +158,15 @@ function passesFilters(decision) {
   return true;
 }
 
+let announcing = false;
+
 /** Print an unseen decision; mark it seen only once stdout has taken it, then exit 0. */
 function announce(decision) {
+  if (announcing) return true;
   if (!passesFilters(decision)) return false;
   const key = seenKey(decision);
   if (seen.has(key)) return false;
+  announcing = true;
   process.stdout.write(`${JSON.stringify(decision)}\n`, (err) => {
     if (err) fail(`stdout write failed: ${err.message}`);
     if (args.seen) appendFileSync(args.seen, `${key}\n`);
@@ -195,23 +199,26 @@ async function fetchCatchUp() {
       // Neither fetch errors nor JSON parse errors are safe to echo verbatim.
       reason = signal.aborted ? "request timed out" : err instanceof SyntaxError ? "invalid JSON response" : "network error";
     }
-    if (!retryable || attempt === CATCH_UP_ATTEMPTS) fail(`catch-up failed: ${reason}`);
+    if (!retryable || attempt === CATCH_UP_ATTEMPTS) throw new Error(`catch-up failed: ${reason}`);
     await new Promise((resolve) => setTimeout(resolve, CATCH_UP_BACKOFF_MS * 2 ** (attempt - 1)));
   }
 }
 
-async function catchUp() {
+async function catchUp({ pruneMemory = true } = {}) {
   const body = await fetchCatchUp();
-  if (!Array.isArray(body?.pending)) fail("catch-up failed: invalid pending snapshot");
+  if (!Array.isArray(body?.pending)) throw new Error("catch-up failed: invalid pending snapshot");
   const pending = body.pending.map((e) => parseDecision(JSON.stringify(e)));
   // A missing or malformed snapshot is not evidence that a seen decision was resolved.
-  if (pending.some((event) => event === null)) fail("catch-up failed: invalid pending snapshot");
-  if (args.seen) {
+  if (pending.some((event) => event === null)) throw new Error("catch-up failed: invalid pending snapshot");
+  if (args.seen && !announcing) {
     // Forget decisions that were resolved, so they announce again if they come back.
     const pendingKeys = new Set(pending.map(seenKey));
     const kept = [...readSeen()].filter((key) => pendingKeys.has(key));
     writeFileSync(args.seen, kept.length ? `${kept.join("\n")}\n` : "");
-    for (const key of seen) if (!pendingKeys.has(key)) seen.delete(key);
+    // SSE replays from a failed attempt may still be in transit when a later
+    // snapshot resolves that item. Keep startup dedupe for this connection;
+    // disk pruning still lets a future invocation announce a new pending cycle.
+    if (pruneMemory) for (const key of seen) if (!pendingKeys.has(key)) seen.delete(key);
   }
   return pending;
 }
@@ -248,7 +255,13 @@ async function drainFrames() {
       // The server's first frame (":ok") means we are subscribed; replay now so nothing falls in a gap.
       caughtUp = true;
       clearTimeout(firstFrameTimer);
-      await catchUp();
+      // Catch-up may need retries, but a healthy stream must keep delivering
+      // live decisions and close frames while that request is in flight.
+      void catchUp({ pruneMemory: false }).then((pending) => {
+        if (!announcing) pending.some(announce);
+      }).catch((err) => {
+        if (!announcing) fail(err.message);
+      });
     }
     if (type === "close") fail("stream closed by the plugin worker");
     if (type !== "message" || data.length === 0) continue;
@@ -275,7 +288,7 @@ async function readStream(stream) {
     buffer += "\n";
     announced = await drainFrames();
   }
-  if (!announced) fail("stream ended");
+  if (!announced && !announcing) fail("stream ended");
 }
 
 /**
@@ -313,7 +326,7 @@ if (status === 501) {
   // "Plugin stream bridge is not enabled": the host never wires a stream bus.
   response.destroy();
   process.stderr.write(`decision-wait: stream bridge not enabled; polling catch-up every ${POLL_INTERVAL_MS / 1000} s\n`);
-  await poll();
+  await poll().catch((err) => fail(err.message));
 } else {
   if (status < 200 || status > 299) fail(`stream failed: HTTP ${status}`);
   firstFrameTimer = setTimeout(() => fail("stream failed: no frame after the headers"), REQUEST_TIMEOUT_MS);

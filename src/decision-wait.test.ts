@@ -49,6 +49,8 @@ interface FakeOptions {
   catchUpStatus?: number;
   /** Reply for the nth catch-up call (the last repeats); 200 uses the pending list. */
   catchUpByCall?: CatchUpReply[];
+  /** Stream traffic can arrive independently of a stalled or failed catch-up response. */
+  onCatchUp?: (call: number, stream: ServerResponse | null) => void;
 }
 
 let server: Server | null = null;
@@ -86,6 +88,7 @@ async function fakePaperclip(options: FakeOptions) {
         expect(JSON.parse(raw)).toEqual({ companyId: "c-1" });
         const call = catchUps.count++;
         catchUps.times.push(Date.now());
+        options.onCatchUp?.(call, stream);
         const replies = options.catchUpByCall;
         const reply = replies ? replies[Math.min(call, replies.length - 1)] : options.stallCatchUp ? "stall" : options.catchUpStatus ?? 200;
         if (reply === "stall") return;
@@ -175,6 +178,8 @@ describe("decision-wait", () => {
     const fake = await fakePaperclip({
       pending: [decision("approval", "ap-1")],
       later: [`data: ${JSON.stringify(decision("interaction", "ix-9"))}\n\n`],
+      // Pruning requires a completed HTTP snapshot, not merely a live SSE hint.
+      laterDelayMs: 100,
     });
     const seen = tmpFile();
     writeFileSync(seen, "approval:ap-1:2026-10-31T12:00:00.000Z\nowner_card:resolved:2026-10-31T12:00:00.000Z\n");
@@ -243,8 +248,10 @@ describe("decision-wait", () => {
 
   it.each([false, true])("recovers from network and body timeouts before announcing (polling=%s)", async (noBridge) => {
     const fake = await fakePaperclip({
-      pending: [decision("approval", "ap-1"), decision("interaction", "ix-new")],
+      pending: noBridge ? [decision("approval", "ap-1"), decision("interaction", "ix-new")] : [decision("approval", "ap-1")],
       noBridge,
+      later: [`data: ${JSON.stringify(decision("interaction", "ix-new"))}\n\n`],
+      laterDelayMs: 100,
       catchUpByCall: ["reset", "stallBody", 200],
     });
     const seen = tmpFile();
@@ -259,6 +266,49 @@ describe("decision-wait", () => {
     ]);
     expect(result.stderr).not.toContain("catch-up failed");
     expect(result.stderr + result.stdout).not.toContain(TOKEN);
+  });
+
+  it("reads a live decision while catch-up is stalled instead of awaiting its retry budget", async () => {
+    const fake = await fakePaperclip({
+      pending: [],
+      stallCatchUp: true,
+      onCatchUp: (_call, stream) => stream?.write(`data: ${JSON.stringify(decision("interaction", "ix-live"))}\n\n`),
+    });
+    const result = await run(fake.url, tmpFile(), TOKEN, { PAPERCLIP_DECISION_WAIT_TIMEOUT_MS: "5000" }, 1500);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).id).toBe("ix-live");
+    expect(fake.catchUps.count).toBe(1);
+  });
+
+  it("handles a worker close while catch-up is stalled", async () => {
+    const fake = await fakePaperclip({
+      pending: [], stallCatchUp: true,
+      onCatchUp: (_call, stream) => stream?.write("event: close\ndata: {}\n\n"),
+    });
+    const result = await run(fake.url, tmpFile(), TOKEN, { PAPERCLIP_DECISION_WAIT_TIMEOUT_MS: "5000" }, 1500);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toBe("decision-wait: stream closed by the plugin worker\n");
+  });
+
+  it("keeps startup dedupe after a failed replay and a successful snapshot prunes disk", async () => {
+    const old = decision("approval", "ap-old");
+    const fake = await fakePaperclip({
+      pending: [], catchUpByCall: [502, 200],
+      onCatchUp: (call, stream) => {
+        if (call === 0) stream?.write(`data: ${JSON.stringify(old)}\n\n`);
+        // A replay from the failed attempt may arrive after the later empty snapshot.
+        else setTimeout(() => stream?.write(`data: ${JSON.stringify(old)}\n\n`), 50);
+      },
+      later: [`data: ${JSON.stringify(decision("interaction", "ix-new"))}\n\n`],
+      laterDelayMs: 150,
+    });
+    const seen = tmpFile();
+    writeFileSync(seen, "approval:ap-old:2026-10-31T12:00:00.000Z\n");
+    const result = await run(fake.url, seen);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).id).toBe("ix-new");
+    expect(fake.catchUps.count).toBe(2);
+    expect(readFileSync(seen, "utf8")).toBe("interaction:ix-new:2026-10-31T12:00:00.000Z\n");
   });
 
   it("recovers when catch-up response headers time out", async () => {
