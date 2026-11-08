@@ -89,8 +89,8 @@ const company = encodeURIComponent(args.company);
 const readSeen = () =>
   args.seen && existsSync(args.seen) ? new Set(readFileSync(args.seen, "utf8").split("\n").filter(Boolean)) : new Set();
 const seen = readSeen();
-// Catch-up replay frames can arrive after a newer snapshot prunes disk. Their
-// explicit wire marker distinguishes them from a genuinely reopened live item.
+// A previously seen hint needs snapshot confirmation after pruning: live and
+// replay frames have identical identities, including reopened approvals.
 const startupSeen = new Set(seen);
 
 /** Accept only the documented shape; anything else on the wire is ignored. */
@@ -225,6 +225,29 @@ async function catchUp() {
   return pending;
 }
 
+let streamCatchUpRunning = false;
+const oldHints = new Set();
+
+/** Coalesce old hints into one snapshot read; keep SSE responsive throughout. */
+async function refreshStream() {
+  if (streamCatchUpRunning || announcing) return;
+  streamCatchUpRunning = true;
+  try {
+    do {
+      // This read is requested after all currently queued hints. Hints arriving
+      // during it need another read if its snapshot prunes their seen key.
+      oldHints.clear();
+      const pending = await catchUp();
+      if (!announcing) pending.some(announce);
+      for (const key of oldHints) if (seen.has(key)) oldHints.delete(key);
+    } while (!announcing && oldHints.size > 0);
+  } catch (err) {
+    if (!announcing) fail(err.message);
+  } finally {
+    streamCatchUpRunning = false;
+  }
+}
+
 /** Poll mode: catch-up returns the pending list, so announce from it directly. */
 async function poll() {
   for (;;) {
@@ -259,11 +282,7 @@ async function drainFrames() {
       clearTimeout(firstFrameTimer);
       // Catch-up may need retries, but a healthy stream must keep delivering
       // live decisions and close frames while that request is in flight.
-      void catchUp().then((pending) => {
-        if (!announcing) pending.some(announce);
-      }).catch((err) => {
-        if (!announcing) fail(err.message);
-      });
+      void refreshStream();
     }
     if (type === "close") {
       if (!announcing) fail("stream closed by the plugin worker");
@@ -273,9 +292,15 @@ async function drainFrames() {
     const payload = data.join("\n");
     const decision = parseDecision(payload);
     if (!decision) continue;
-    // Only replay frames retain startup dedupe after pruning. Live approvals
-    // can reopen with the same original createdAt and must be allowed through.
-    if (JSON.parse(payload).replay === true && startupSeen.has(seenKey(decision))) continue;
+    const key = seenKey(decision);
+    if (startupSeen.has(key) && (streamCatchUpRunning || !seen.has(key))) {
+      // Never guess whether an old frame is a replay or a reopened cycle. A
+      // read requested after this hint confirms it is still pending. Queue
+      // hints during the initial snapshot too, rather than losing that race.
+      oldHints.add(key);
+      void refreshStream();
+      continue;
+    }
     if (announce(decision)) return true;
   }
   return false;

@@ -66,7 +66,7 @@ const approval = (id: string, extra: Partial<Approval> = {}) =>
 interface Emitted {
   channel: string;
   companyId: string | null;
-  event: DecisionEvent & { replay?: true };
+  event: DecisionEvent;
 }
 
 async function setup(config: Record<string, unknown> = {}) {
@@ -361,7 +361,7 @@ describe("catch-up", () => {
     expect(pending.map((e) => `${e.kind}:${e.id}`).sort()).toEqual(expected);
   });
 
-  it("marks only catch-up stream replays, not HTTP snapshots or reopened live approvals", async () => {
+  it("preserves the same public shape for replay, HTTP snapshots and reopened live approvals", async () => {
     const { harness, emitted } = await setup({ runFailures: { enabled: false } });
     harness.seed({ approvals: [approval("ap-1")] });
     await harness.runJob(SCAN_JOB_KEY);
@@ -373,7 +373,7 @@ describe("catch-up", () => {
     const pending = (response.body as { pending: DecisionEvent[] }).pending;
     expect(pending).toEqual([original]);
     expect(pending[0]).not.toHaveProperty("replay");
-    expect(emitted.map(({ event }) => event)).toEqual([{ ...original, replay: true }]);
+    expect(emitted.map(({ event }) => event)).toEqual([original]);
 
     harness.seed({ approvals: [approval("ap-1", { status: "approved" } as Partial<Approval>)] });
     await harness.emit("approval.decided", {}, { companyId: COMPANY, entityId: "ap-1" });
@@ -856,7 +856,6 @@ describe("no payload text", () => {
         "kind",
         "originId",
         "originKind",
-        ...(event.replay === true ? ["replay"] : []),
         "url",
       ]);
       expect(JSON.stringify(event)).not.toContain("secret-payload");

@@ -52,6 +52,8 @@ interface FakeOptions {
   catchUpStatus?: number;
   /** Reply for the nth catch-up call (the last repeats); 200 uses the pending list. */
   catchUpByCall?: CatchUpReply[];
+  /** Delay successful HTTP delivery after capturing the pending snapshot. */
+  catchUpDelayMs?: number;
   /** Stream traffic can arrive independently of a stalled or failed catch-up response. */
   onCatchUp?: (call: number, stream: ServerResponse | null) => void;
 }
@@ -117,7 +119,7 @@ async function fakePaperclip(options: FakeOptions) {
         // Like the worker: replay onto the stream first, then answer.
         stream?.write(`event: open\ndata: {"type":"open"}\n\n`);
         if (options.replay !== false) {
-          for (const event of pending) stream?.write(`data: ${JSON.stringify({ ...event, replay: true })}\n\n`);
+          for (const event of pending) stream?.write(`data: ${JSON.stringify(event)}\n\n`);
         }
         const sendLater = () => {
           for (const frame of options.later ?? []) stream?.write(frame);
@@ -126,7 +128,9 @@ async function fakePaperclip(options: FakeOptions) {
         if (options.laterDelayMs) setTimeout(sendLater, options.laterDelayMs);
         else sendLater();
         if (options.resetAfterCatchUp) setTimeout(() => stream?.socket?.resetAndDestroy(), 50);
-        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ pending }));
+        const sendSnapshot = () => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ pending }));
+        if (options.catchUpDelayMs) setTimeout(sendSnapshot, options.catchUpDelayMs);
+        else sendSnapshot();
       });
       return;
     }
@@ -308,13 +312,13 @@ describe("decision-wait", () => {
   });
 
   it("keeps startup dedupe after a failed replay and a successful snapshot prunes disk", async () => {
-    const old = { ...decision("approval", "ap-old"), replay: true };
+    const old = decision("approval", "ap-old");
     const fake = await fakePaperclip({
       pending: [], catchUpByCall: [502, 200],
       onCatchUp: (call, stream) => {
         if (call === 0) stream?.write(`data: ${JSON.stringify(old)}\n\n`);
         // A replay from the failed attempt may arrive after the later empty snapshot.
-        else setTimeout(() => stream?.write(`data: ${JSON.stringify(old)}\n\n`), 50);
+        else if (call === 1) setTimeout(() => stream?.write(`data: ${JSON.stringify(old)}\n\n`), 50);
       },
       later: [`data: ${JSON.stringify(decision("interaction", "ix-new"))}\n\n`],
       laterDelayMs: 150,
@@ -324,18 +328,37 @@ describe("decision-wait", () => {
     const result = await run(fake.url, seen);
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).id).toBe("ix-new");
-    expect(fake.catchUps.count).toBe(2);
+    expect(fake.catchUps.count).toBe(4);
     expect(readFileSync(seen, "utf8")).toBe("interaction:ix-new:2026-10-31T12:00:00.000Z\n");
   });
 
   it("announces a reopened approval on the same stream after an empty snapshot", async () => {
     const old = decision("approval", "ap-old");
     const fake = await fakePaperclip({
-      pending: [], catchUpByCall: [502, 200],
+      pending: [], catchUpByCall: [502, 200], pendingByCall: [[], [], [old]],
       onCatchUp: (call, stream) => {
-        if (call === 0) stream?.write(`data: ${JSON.stringify({ ...old, replay: true })}\n\n`);
+        if (call === 1) setTimeout(() => stream?.write(`data: ${JSON.stringify(old)}\n\n`), 100);
       },
-      later: [`data: ${JSON.stringify(old)}\n\n`], laterDelayMs: 100, endAfterLater: true,
+    });
+    const seen = tmpFile();
+    writeFileSync(seen, "approval:ap-old:2026-10-31T12:00:00.000Z\n");
+    const result = await run(fake.url, seen);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(old);
+    expect(fake.catchUps.count).toBe(3);
+    expect(readFileSync(seen, "utf8")).toBe("approval:ap-old:2026-10-31T12:00:00.000Z\n");
+  });
+
+  it.each([true, false])("confirms a reopened approval hint across HTTP/SSE ordering (beforeSnapshot=%s)", async (beforeSnapshot) => {
+    const old = decision("approval", "ap-old");
+    const fake = await fakePaperclip({
+      pending: [], pendingByCall: [[], [old]],
+      catchUpDelayMs: beforeSnapshot ? 100 : undefined,
+      onCatchUp: (call, stream) => {
+        // The later hint can also be another client's catch-up discovery: its
+        // shape is identical to a native live approval event.
+        if (call === 0) setTimeout(() => stream?.write(`data: ${JSON.stringify(old)}\n\n`), beforeSnapshot ? 0 : 100);
+      },
     });
     const seen = tmpFile();
     writeFileSync(seen, "approval:ap-old:2026-10-31T12:00:00.000Z\n");
@@ -344,6 +367,24 @@ describe("decision-wait", () => {
     expect(JSON.parse(result.stdout)).toEqual(old);
     expect(fake.catchUps.count).toBe(2);
     expect(readFileSync(seen, "utf8")).toBe("approval:ap-old:2026-10-31T12:00:00.000Z\n");
+  });
+
+  it("suppresses a delayed previously-seen live audience update that is no longer pending", async () => {
+    const old = decision("interaction", "ix-old", { audience: "operator" });
+    const fake = await fakePaperclip({
+      pending: [],
+      onCatchUp: (call, stream) => {
+        if (call === 0) setTimeout(() => stream?.write(`data: ${JSON.stringify(old)}\n\n`), 100);
+        if (call === 1) setTimeout(() => stream?.write(`data: ${JSON.stringify(decision("interaction", "ix-new"))}\n\n`), 50);
+      },
+    });
+    const seen = tmpFile();
+    writeFileSync(seen, "interaction:ix-old:2026-10-31T12:00:00.000Z\n");
+    const result = await run(fake.url, seen);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).id).toBe("ix-new");
+    expect(fake.catchUps.count).toBe(2);
+    expect(readFileSync(seen, "utf8")).toBe("interaction:ix-new:2026-10-31T12:00:00.000Z\n");
   });
 
   it.each([undefined, null, 7, "", "not-a-date"])("rejects snapshot createdAt=%s without pruning or announcing", async (createdAt) => {

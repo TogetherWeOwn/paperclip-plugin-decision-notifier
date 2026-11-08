@@ -555,7 +555,7 @@ export class DecisionNotifier {
         : [];
       return [...decisions, ...failures];
     });
-    for (const event of pending) this.emitEvent(companyId, event, true);
+    for (const event of pending) this.emitEvent(companyId, event);
     this.ctx.logger.info("decision catch-up completed", {
       companyId,
       durationMs: Math.round(performance.now() - startedAt),
@@ -1119,7 +1119,7 @@ export class DecisionNotifier {
     this.emitEvent(companyId, toEvent(decision));
   }
 
-  private emitEvent(companyId: string, event: NotifierEvent, replay = false): void {
+  private emitEvent(companyId: string, event: NotifierEvent): void {
     // emit() has no company argument: the worker routes it to the company the
     // channel was last opened for. Open only on a company change, so a client
     // sees a single `open` event rather than one per decision.
@@ -1127,9 +1127,7 @@ export class DecisionNotifier {
       this.ctx.streams.open(STREAM_CHANNEL, companyId);
       this.openedCompanyId = companyId;
     }
-    const payload = toPublic(event);
-    // Stream-only metadata: snapshots and stored events keep their public shape.
-    this.ctx.streams.emit(STREAM_CHANNEL, replay ? { ...payload, replay: true } : payload);
+    this.ctx.streams.emit(STREAM_CHANNEL, toPublic(event));
   }
 
   private async load(companyId: string): Promise<PendingMap> {
