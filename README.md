@@ -75,12 +75,47 @@ Paperclip does not tell a plugin when a client connects, so catch-up is an expli
 
 ### `paperclip-decision-wait`
 
-`bin/decision-wait.mjs` does the above and exits on the first decision or run failure group it has not seen before, printing it as one JSON line (for `run_failure`, with the fields above; the excerpt is capped at 200 characters again on the client). It is meant to run as a background command that wakes a session when it exits:
+`bin/decision-wait.mjs` defaults to **native actor attention** in 0.4.0. It reads the waiting board user's own desk, not the plugin's company-wide snapshot, and exits after printing one eligible ask as a JSON line. Re-arm it after handling the notification. The native mode requires the session, attention and inbox-dismissal APIs available in Paperclip 2026.1106.0. It never falls back to the broader plugin source on a failed/denied native read.
 
 ```sh
 PAPERCLIP_API_URL=https://paperclip.example.com \
 PAPERCLIP_BOARD_TOKEN_FILE=$HOME/.paperclip/board-token \
-paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-decisions-seen
+paperclip-decision-wait --company <companyId> --seen $HOME/.cache/paperclip-attention-seen
+```
+
+The credential must belong to the intended waiting user. The waiter verifies `/api/auth/get-session` and calls only that actor's `GET /api/companies/:id/attention` and `/inbox-dismissals`; it never supplies a user override. Actor-owned visibility, snoozes and dismissals remain native authority. A notification grants no permission to answer, including owner-only asks or council windows.
+
+#### Native event kinds and reminders
+
+| kind | delivered when |
+|---|---|
+| `issue_thread_interaction` | the actor's desk exposes a pending thread interaction |
+| `approval` | the actor's desk exposes a pending approval |
+| `decision` | the actor's desk exposes an open standalone decision |
+
+```json
+{"kind":"issue_thread_interaction","id":"…","issueIdentifier":"EXAMPLE-1","url":"/EXAMPLE/issues/…#interaction-…","createdAt":"2026-10-31T11:00:00.000Z","reminder":true,"ageMs":1800000,"interactionKind":"request_confirmation","addresseeUserId":"…"}
+```
+
+- `id` is the underlying subject ID, not the desk row's composite ID. The output contains only the listed fields, not question text, summaries, `whyNow`, arbitrary payloads or dismissal records. `ageMs` is age since creation, not time since last delivery. Links are same-origin paths; standalone decision links retain `decisionId`.
+- Seen state suppresses only delivery **within 30 minutes**. `PAPERCLIP_DECISION_WAIT_REMINDER_MS` overrides that interval (positive whole milliseconds up to 2^31−1; invalid values use the default). A delivered but unanswered item is read again and re-delivered with `reminder: true` after the interval. It is not acknowledged or resolved by delivery. Resolved, archived, snoozed or currently dismissed items are not reminded.
+- Personal snoozes remain active until their future deadline even if activity changes. Dismissals remain active while `dismissedAt >= activityAt`; newer source activity can resurface them. Company triage `snoozedUntil` is independently honored. Suppression reads must succeed before output; no API response body is logged on failure. The supplied native `dismissalKey` is matched verbatim, not reconstructed from the desk row ID.
+- The ledger stores versioned JSON-line timestamps scoped to API origin, company and authenticated user. Existing bare `kind:id:createdAt` keys migrate as immediately reminder-eligible; no old permanent suppression survives. Use **one process and a separate ledger per actor/source**. Records are atomically replaced after stdout accepts the event; there is no cross-process lock. The ledger retains at most 10,000 records/30 days and refuses input larger than 4 MiB. Eviction may permit an extra notification; it cannot acknowledge an ask.
+- Native polling defaults to 30 seconds (`PAPERCLIP_DECISION_WAIT_POLL_MS`); newly visible asks are emitted on the next successful poll, not via a native push subscription. Each pass requests at most five 100-item pages with one shared request deadline (`PAPERCLIP_DECISION_WAIT_TIMEOUT_MS`, default 30 seconds), then reads up to 10,000 dismissal rows. Responses are limited to 4 MiB each and redirects are refused. A page-budget warning means partial coverage, never COMPLETE. A stale/invalid cursor or failed/malformed read exits 1; re-arming starts from the first page.
+- **Completeness is not claimed.** The native desk can collapse siblings, normal collection can cap standalone decisions before paging, and this client stops after 500 rows. It does not use `all=true`, reconstruct hidden interactions, or prune delivery history just because an incomplete desk page omits an item. The server's full catch-up performance/completeness objective remains separate.
+- Native attention supplies neither plugin `audience` nor issue-origin hints. As with unknown fields from older plugins, native notifications pass `--audience` and `--exclude-origin-kind` as unknown; those flags **do not narrow the native desk**. The actor is the scope boundary. Re-read native addressee/policy/origin before acting. Optional `blocker_attention`/`failed_run` digests are not implemented in this mode; other desk kinds are ignored.
+- The waiter does not write native task/inbox state or install background host automation. See the [threat model](docs/attention-wait-threat-model.md). Native GETs can cause the server's normal retention/queue maintenance; this client does not add a core patch or independent task scheduler.
+
+#### Legacy plugin stream source
+
+Use `--source plugin` to retain the previous SSE/catch-up behavior, including grouped `run_failure` and `owner_card` events, for older hosts or company-wide advisory consumers. **Legacy mode retains permanent seen-key dedupe and does not honor actor desk snoozes/dismissals. It is not the reminder/suppression path.** The plugin's wire event shapes and SDK scan remain unchanged, so client resilience work can proceed independently.
+
+The legacy invocation is:
+
+```sh
+PAPERCLIP_API_URL=https://paperclip.example.com \
+PAPERCLIP_BOARD_TOKEN_FILE=$HOME/.paperclip/board-token \
+paperclip-decision-wait --source plugin --company <companyId> --seen $HOME/.cache/paperclip-decisions-seen
 ```
 
 - `--company` is required. `--api` overrides `PAPERCLIP_API_URL`; a trailing `/api` is stripped from either. `--plugin` overrides the plugin ID (default `togetherweown.decision-notifier`). `--audience <csv>` wakes only for decisions with one of the listed audiences (`owner`, `operator`, `board`, `anyone`); anything else is silently skipped and never marked seen. `--exclude-origin-kind <csv>` skips events whose `originKind` is listed (for example `plugin:board-council`), also without marking them seen. With neither flag the waiter behaves exactly as before. Events with no audience (older plugins) always pass `--audience`, and `run_failure` items ignore it entirely.

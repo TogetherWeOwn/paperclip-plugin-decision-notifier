@@ -127,7 +127,7 @@ function run(
 
 function spawnScript(argv: string[], env: Record<string, string>, killAfterMs = 5000) {
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
-    const child = spawn(process.execPath, [SCRIPT, ...argv], { env: { PATH: process.env.PATH, ...env } });
+    const child = spawn(process.execPath, [SCRIPT, "--source", "plugin", ...argv], { env: { PATH: process.env.PATH, ...env } });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (c) => (stdout += c));
