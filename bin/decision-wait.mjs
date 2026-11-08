@@ -227,6 +227,7 @@ async function catchUp() {
 
 let streamCatchUpRunning = false;
 const oldHints = new Set();
+let confirmedPending = new Map();
 
 /** Coalesce old hints into one snapshot read; keep SSE responsive throughout. */
 async function refreshStream() {
@@ -235,13 +236,16 @@ async function refreshStream() {
   try {
     do {
       // This read is requested after all currently queued hints. Hints arriving
-      // during it need another read if its snapshot prunes their seen key.
+      // during it need another read unless its snapshot confirms their payload.
       oldHints.clear();
       const pending = await catchUp();
       if (!announcing) pending.some(announce);
-      // Snapshot presence confirms a hint even when routing excludes it. Do
-      // not mark excluded decisions seen, or treat their replay as new work.
-      for (const decision of pending) oldHints.delete(seenKey(decision));
+      // Confirm excluded work without marking it seen. Keep the payload so a
+      // replay delivered after HTTP does not start another read; a different
+      // routing update received during this read still needs confirmation.
+      confirmedPending = new Map(pending.filter((decision) => startupSeen.has(seenKey(decision)))
+        .map((decision) => [seenKey(decision), JSON.stringify(decision)]));
+      for (const payload of confirmedPending.values()) oldHints.delete(payload);
     } while (!announcing && oldHints.size > 0);
   } catch (err) {
     if (!announcing) fail(err.message);
@@ -299,7 +303,9 @@ async function drainFrames() {
       // Never guess whether an old frame is a replay or a reopened cycle. A
       // read requested after this hint confirms it is still pending. Queue
       // hints during the initial snapshot too, rather than losing that race.
-      oldHints.add(key);
+      const payload = JSON.stringify(decision);
+      if (confirmedPending.get(key) === payload) continue;
+      oldHints.add(payload);
       void refreshStream();
       continue;
     }

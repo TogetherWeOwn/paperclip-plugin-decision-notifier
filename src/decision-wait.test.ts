@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn } from "node:child_process";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -32,6 +32,8 @@ interface FakeOptions {
   later?: string[];
   /** Emit catch-up replay frames (false exercises HTTP-only selection). */
   replay?: boolean;
+  /** Deliver replay messages after HTTP to exercise independent transport ordering. */
+  replayDelayMs?: number;
   /** End the stream right after the later frames. */
   endAfterLater?: boolean;
   /** Send the later frames this long after catch-up instead of at once, leaving the stream idle. */
@@ -119,7 +121,11 @@ async function fakePaperclip(options: FakeOptions) {
         // Like the worker: replay onto the stream first, then answer.
         stream?.write(`event: open\ndata: {"type":"open"}\n\n`);
         if (options.replay !== false) {
-          for (const event of pending) stream?.write(`data: ${JSON.stringify(event)}\n\n`);
+          const replay = () => {
+            for (const event of pending) stream?.write(`data: ${JSON.stringify(event)}\n\n`);
+          };
+          if (options.replayDelayMs) setTimeout(replay, options.replayDelayMs);
+          else replay();
         }
         const sendLater = () => {
           for (const frame of options.later ?? []) stream?.write(frame);
@@ -141,6 +147,7 @@ async function fakePaperclip(options: FakeOptions) {
   const port = typeof address === "object" && address ? address.port : 0;
   return {
     url: `http://127.0.0.1:${port}`, seenAuth, catchUps,
+    sendDecision: (event: object) => stream?.write(`data: ${JSON.stringify(event)}\n\n`),
     breakStream: (mode: "close" | "reset") => {
       if (mode === "close") stream?.write("event: close\ndata: {}\n\n");
       else stream?.socket?.resetAndDestroy();
@@ -372,23 +379,21 @@ describe("decision-wait", () => {
   it.each([
     { filter: "audience", argv: ["--audience", "owner"], extra: { audience: "board" } },
     { filter: "origin", argv: ["--exclude-origin-kind", "council"], extra: { originKind: "council" } },
-  ])("retires a confirmed reopened hint excluded by $filter without marking it seen", async ({ argv, extra }) => {
+  ].flatMap((filter) => [true, false].map((replayFirst) => ({ ...filter, replayFirst }))))(
+    "retires a confirmed reopened hint excluded by $filter (replayFirst=$replayFirst) without marking it seen", async ({ argv, extra, replayFirst }) => {
     const old = decision("approval", "ap-old", extra);
     const eligible = decision("interaction", "ix-live", { audience: "owner" });
     const seen = tmpFile();
     writeFileSync(seen, "approval:ap-old:2026-10-31T12:00:00.000Z\n");
     const idle: { count: number; seen: string }[] = [];
-    let pruned: string | undefined;
     const fake = await fakePaperclip({
-      pending: [], pendingByCall: [[], [old]], catchUpDelayMs: 40,
+      pending: [], pendingByCall: [[], [old]],
+      catchUpDelayMs: replayFirst ? 40 : undefined,
+      replayDelayMs: replayFirst ? undefined : 40,
       onCatchUp: (call, stream) => {
-        if (call === 0) setTimeout(() => {
-          pruned = readFileSync(seen, "utf8");
-          stream?.write(`data: ${JSON.stringify(old)}\n\n`);
-        }, 100);
         if (call === 1) {
-          // Replays precede each successful HTTP response. Observe two quiet
-          // windows with no independent event before delivering eligible work.
+          // Observe two quiet windows with no independent event before
+          // delivering eligible work, under either HTTP/replay ordering.
           setTimeout(() => idle.push({ count: fake.catchUps.count, seen: readFileSync(seen, "utf8") }), 200);
           setTimeout(() => {
             idle.push({ count: fake.catchUps.count, seen: readFileSync(seen, "utf8") });
@@ -397,14 +402,44 @@ describe("decision-wait", () => {
         }
       },
     });
-    const result = await run(fake.url, seen, TOKEN, {}, 3000, argv);
-    expect(pruned).toBe("");
+    const running = run(fake.url, seen, TOKEN, {}, 3000, argv);
+    await vi.waitFor(() => expect(readFileSync(seen, "utf8")).toBe(""));
+    fake.sendDecision(old);
+    const result = await running;
     expect(idle).toEqual([{ count: 2, seen: "" }, { count: 2, seen: "" }]);
     expect(fake.catchUps.count).toBe(2);
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     expect(JSON.parse(result.stdout)).toEqual(eligible);
     expect(readFileSync(seen, "utf8")).toBe("interaction:ix-live:2026-10-31T12:00:00.000Z\n");
+  });
+
+  it.each([false, true])("confirms newer eligible routing received during an excluded snapshot (staleReplayLast=%s)", async (staleReplayLast) => {
+    const old = decision("interaction", "ix-old", { audience: "board" });
+    const updated = { ...old, audience: "owner" };
+    const seen = tmpFile();
+    writeFileSync(seen, "interaction:ix-old:2026-10-31T12:00:00.000Z\n");
+    const fake = await fakePaperclip({
+      pending: [], pendingByCall: [[], [old], [updated]], catchUpDelayMs: 100,
+      onCatchUp: (call, stream) => {
+        if (call === 1) {
+          setTimeout(() => {
+            stream?.write(`data: ${JSON.stringify(updated)}\n\n`);
+            if (staleReplayLast) stream?.write(`data: ${JSON.stringify(old)}\n\n`);
+          }, 20);
+          setTimeout(() => stream?.write("event: close\ndata: {}\n\n"), 500);
+        }
+      },
+    });
+    const running = run(fake.url, seen, TOKEN, {}, 3000, ["--audience", "owner"]);
+    await vi.waitFor(() => expect(readFileSync(seen, "utf8")).toBe(""));
+    fake.sendDecision(old);
+    const result = await running;
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual(updated);
+    expect(fake.catchUps.count).toBe(3);
+    expect(readFileSync(seen, "utf8")).toBe("interaction:ix-old:2026-10-31T12:00:00.000Z\n");
   });
 
   it("suppresses a delayed previously-seen live audience update that is no longer pending", async () => {
