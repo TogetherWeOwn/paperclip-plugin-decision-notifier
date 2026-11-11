@@ -1,0 +1,62 @@
+# The highest changed-file tier wins; sensitive wins overlaps. Unmatched and
+# new paths are sensitive. This file is always sensitive. QA reviews every PR;
+# sensitive or unclassified changes require Security -> QA. QA verifies the
+# author's risk_tier attestation and can escalate any change.
+#
+# Content always escalates to sensitive regardless of path: new or changed
+# public endpoints or input parsing; auth, authz or sessions; crypto or keys;
+# secrets or credentials; permission checks; tenant isolation or personal
+# data; SQL, schema or migrations; dependencies or lockfiles (including dev
+# dependencies); CI or workflows; weakened assertions, deleted tests or
+# snapshots, or lowered test gates. Low test paths are additive-only, never
+# an exemption for weakening tests.
+#
+# Sensitive-floor globs cannot be downgraded without explicit Security
+# approval on the PR. Ordinary modules require an individual audit showing no
+# untrusted input, sensitive output, permissions, persistence or trust-boundary
+# effect. When in doubt, leave a path sensitive.
+
+version: 1
+default_tier: sensitive
+
+tiers:
+  low:
+    # Prose only; content triggers and sensitive overlaps still apply.
+    - "README.md"
+    - "CHANGELOG.md"
+    - "LICENSE"
+    # Additive unit tests only; deletions and weakened coverage escalate.
+    - "src/*.test.ts"
+  ordinary: []
+  sensitive:
+    # Review policy, ownership, CI and agent instructions.
+    - ".github/**"
+    - "CODEOWNERS"
+    - "**/CODEOWNERS"
+    - "AGENTS.md"
+    - "**/AGENTS.md"
+    - "CLAUDE.md"
+    - "**/CLAUDE.md"
+    - "SKILL.md"
+    - "**/SKILL.md"
+    - ".claude/**"
+    - "**/.claude/**"
+    - "skills/**"
+    - "**/skills/**"
+    # Dependency manifests, build and test configuration.
+    - "package.json"
+    - "package-lock.json"
+    - ".npmrc"
+    - "tsconfig*.json"
+    - "vitest.config.ts"
+    - "Makefile"
+    - "Dockerfile*"
+    - "scripts/**"
+    # Executables, runtime and deployment infrastructure.
+    - "bin/**"
+    - "infra/**"
+    - "deploy/**"
+    - "migrations/**"
+    - "docs/attention-wait-threat-model.md"
+    # Other runtime source is intentionally unmatched, hence sensitive; it
+    # processes decisions, notifications and network-facing data.
