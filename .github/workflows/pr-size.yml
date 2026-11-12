@@ -27,7 +27,11 @@
 # `size-exception` label is applied or removed or a review is submitted
 # or dismissed, so granting an exception re-evaluates the check without
 # a manual re-run - and revoking it re-runs and fails the gate, instead
-# of leaving a stale passing check on the pull request.
+# of leaving a stale passing check on the pull request. The
+# `pull_request.edited` type is subscribed for the same reason: changing
+# a PR's base branch changes its diff size, so a previously passing gate
+# must not stay green for an oversized PR; extra runs on title/body edits
+# are harmless.
 #
 # The weekly tally's schedule lives here, in the caller, because the tally
 # is per-repository. It calls a SEPARATE reusable file so this job can stay
@@ -66,7 +70,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@0a82874b4cbb9a01075426b955ec5095dc89935f
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@47839ef8d93036689bbefc766b3c6ffabd874993
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       # This repo's generated paths, excluded on top of the script's
@@ -84,7 +88,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@0a82874b4cbb9a01075426b955ec5095dc89935f
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@47839ef8d93036689bbefc766b3c6ffabd874993
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       exclude-extra: "dist/**,coverage/**"
@@ -96,4 +100,4 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@0a82874b4cbb9a01075426b955ec5095dc89935f
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@47839ef8d93036689bbefc766b3c6ffabd874993
